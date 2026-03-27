@@ -1,7 +1,15 @@
 use crate::config::RoutingConfig;
 use crate::goosed::{GoosedStatus, GoosedSupervisor};
 use anyhow::Result;
-use axum::{extract::State as AxumState, http::StatusCode, routing::get, Json, Router};
+use axum::{
+    body::{Body, Bytes},
+    extract::{Path as AxumPath, State as AxumState},
+    http::{header, HeaderValue, StatusCode},
+    response::Response,
+    routing::{get, post},
+    Json, Router,
+};
+use futures_util::StreamExt;
 use mesh_llm_plugin::{
     plugin_server_info, proto, PluginContext, PluginHandle, PluginInitializeRequest,
     PluginMetadata, PluginRuntime, PluginStartupPolicy, SimplePlugin,
@@ -13,7 +21,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, System};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio_stream::wrappers::ReceiverStream;
 
 const PLUGIN_ID: &str = "flock";
 const FLOCK_CHANNEL: &str = "flock";
@@ -22,6 +31,10 @@ const MESSAGE_KIND_ADVERTISEMENT: &str = "flock.advertisement.v1";
 const MESSAGE_KIND_SNAPSHOT_REQUEST: &str = "flock.snapshot_request.v1";
 const MESSAGE_KIND_HTTP_REQUEST: &str = "flock.http.request.v1";
 const MESSAGE_KIND_HTTP_RESPONSE: &str = "flock.http.response.v1";
+const MESSAGE_KIND_HTTP_STREAM_REQUEST: &str = "flock.http.stream_request.v1";
+const MESSAGE_KIND_HTTP_STREAM_OPEN: &str = "flock.http.stream_open.v1";
+const MESSAGE_KIND_HTTP_STREAM_CHUNK: &str = "flock.http.stream_chunk.v1";
+const MESSAGE_KIND_HTTP_STREAM_CLOSE: &str = "flock.http.stream_close.v1";
 
 pub struct PluginState {
     config_path: PathBuf,
@@ -37,6 +50,8 @@ pub struct PluginState {
     outbound: Option<PluginHandle>,
     next_proxy_request_id: u64,
     pending_proxy_requests: HashMap<String, oneshot::Sender<HttpProxyResponse>>,
+    pending_stream_open: HashMap<String, oneshot::Sender<HttpStreamOpen>>,
+    pending_stream_bodies: HashMap<String, mpsc::Sender<Result<Bytes, std::convert::Infallible>>>,
 }
 
 #[derive(Debug)]
@@ -83,6 +98,20 @@ struct HttpProxyResponseMeta {
 struct HttpProxyResponse {
     status_code: u16,
     body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct HttpStreamOpen {
+    protocol_version: u32,
+    request_id: String,
+    status_code: u16,
+    content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct HttpStreamClose {
+    protocol_version: u32,
+    request_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -199,6 +228,8 @@ pub async fn run_plugin(config_path: PathBuf, routing: RoutingConfig) -> Result<
         outbound: None,
         next_proxy_request_id: 1,
         pending_proxy_requests: HashMap::new(),
+        pending_stream_open: HashMap::new(),
+        pending_stream_bodies: HashMap::new(),
     }));
 
     {
@@ -315,6 +346,12 @@ async fn ensure_local_http_server(state: Arc<Mutex<PluginState>>) -> Result<()> 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let app = Router::new()
         .route("/status", get(http_status))
+        .route("/sessions", get(http_list_sessions))
+        .route("/sessions/insights", get(http_session_insights))
+        .route("/sessions/{session_id}", get(http_get_session))
+        .route("/sessions/{session_id}/events", get(http_session_events))
+        .route("/sessions/{session_id}/reply", post(http_session_reply))
+        .route("/sessions/{session_id}/cancel", post(http_session_cancel))
         .route("/flock/health", get(http_flock_health))
         .route("/flock/hosts", get(http_flock_hosts))
         .with_state(state.clone());
@@ -353,7 +390,8 @@ async fn handle_channel_message(
         }
         MESSAGE_KIND_HTTP_REQUEST => {
             let meta: HttpProxyRequestMeta = serde_json::from_str(&message.metadata_json)?;
-            let response = forward_local_goosed_request(state, &meta, &message.body).await;
+            let response =
+                forward_local_goosed_request(state, &meta.method, &meta.path, message.body).await;
             let (status_code, body) = match response {
                 Ok(value) => (value.status_code, value.body),
                 Err(error) => (502, error.to_string().into_bytes()),
@@ -387,6 +425,37 @@ async fn handle_channel_message(
             }
             Ok(())
         }
+        MESSAGE_KIND_HTTP_STREAM_REQUEST => {
+            let meta: HttpProxyRequestMeta = serde_json::from_str(&message.metadata_json)?;
+            spawn_local_goosed_stream(state.clone(), message.source_peer_id, meta);
+            Ok(())
+        }
+        MESSAGE_KIND_HTTP_STREAM_OPEN => {
+            let meta: HttpStreamOpen = serde_json::from_str(&message.metadata_json)?;
+            let mut state = state.lock().await;
+            if let Some(sender) = state.pending_stream_open.remove(&meta.request_id) {
+                let _ = sender.send(meta);
+            }
+            Ok(())
+        }
+        MESSAGE_KIND_HTTP_STREAM_CHUNK => {
+            let request_id = message.correlation_id.clone();
+            let sender = {
+                let state = state.lock().await;
+                state.pending_stream_bodies.get(&request_id).cloned()
+            };
+            if let Some(sender) = sender {
+                let _ = sender.send(Ok(Bytes::from(message.body))).await;
+            }
+            Ok(())
+        }
+        MESSAGE_KIND_HTTP_STREAM_CLOSE => {
+            let meta: HttpStreamClose = serde_json::from_str(&message.metadata_json)?;
+            let mut state = state.lock().await;
+            state.pending_stream_open.remove(&meta.request_id);
+            state.pending_stream_bodies.remove(&meta.request_id);
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -394,7 +463,7 @@ async fn handle_channel_message(
 async fn http_status(
     AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
 ) -> Result<(StatusCode, String), StatusCode> {
-    match proxy_status_to_selected_host(&state).await {
+    match proxy_request_to_selected_host(&state, "GET", "/status", Vec::new()).await {
         Ok(response) => Ok((
             StatusCode::from_u16(response.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
             String::from_utf8_lossy(&response.body).into_owned(),
@@ -410,6 +479,48 @@ async fn http_status(
             }
         }
     }
+}
+
+async fn http_list_sessions(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+) -> Result<Response, StatusCode> {
+    proxy_json_route(&state, "/sessions").await
+}
+
+async fn http_session_insights(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+) -> Result<Response, StatusCode> {
+    proxy_json_route(&state, "/sessions/insights").await
+}
+
+async fn http_get_session(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Response, StatusCode> {
+    proxy_json_route(&state, &format!("/sessions/{session_id}")).await
+}
+
+async fn http_session_reply(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    AxumPath(session_id): AxumPath<String>,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    proxy_json_write_route(&state, "POST", &format!("/sessions/{session_id}/reply"), body.to_vec()).await
+}
+
+async fn http_session_cancel(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    AxumPath(session_id): AxumPath<String>,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    proxy_write_route(&state, "POST", &format!("/sessions/{session_id}/cancel"), body.to_vec()).await
+}
+
+async fn http_session_events(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Response, StatusCode> {
+    proxy_event_stream_route(&state, &format!("/sessions/{session_id}/events")).await
 }
 
 async fn http_flock_health(
@@ -446,8 +557,122 @@ async fn http_flock_hosts(
     )
 }
 
-async fn proxy_status_to_selected_host(
+async fn proxy_json_route(
     state: &Arc<Mutex<PluginState>>,
+    path: &str,
+) -> Result<Response, StatusCode> {
+    proxy_json_write_route(state, "GET", path, Vec::new()).await
+}
+
+async fn proxy_json_write_route(
+    state: &Arc<Mutex<PluginState>>,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> Result<Response, StatusCode> {
+    match proxy_request_to_selected_host(state, method, path, body.clone()).await {
+        Ok(response) => Ok(response_with_content_type(response, Some("application/json"))),
+        Err(_) => match forward_local_goosed_request(state, method, path, body).await {
+            Ok(response) => Ok(response_with_content_type(response, Some("application/json"))),
+            Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        },
+    }
+}
+
+async fn proxy_write_route(
+    state: &Arc<Mutex<PluginState>>,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> Result<Response, StatusCode> {
+    match proxy_request_to_selected_host(state, method, path, body.clone()).await {
+        Ok(response) => Ok(response_with_content_type(response, None)),
+        Err(_) => match forward_local_goosed_request(state, method, path, body).await {
+            Ok(response) => Ok(response_with_content_type(response, None)),
+            Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        },
+    }
+}
+
+async fn proxy_event_stream_route(
+    state: &Arc<Mutex<PluginState>>,
+    path: &str,
+) -> Result<Response, StatusCode> {
+    let (handle, target_peer_id, request_id, open_rx, body_rx) = {
+        let mut state = state.lock().await;
+        let handle = state
+            .outbound
+            .clone()
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        let target_peer_id = select_proxy_host(&state).ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        let request_id = format!("stream-{}", state.next_proxy_request_id);
+        state.next_proxy_request_id += 1;
+        let (open_tx, open_rx) = oneshot::channel();
+        let (body_tx, body_rx) = mpsc::channel(128);
+        state.pending_stream_open.insert(request_id.clone(), open_tx);
+        state.pending_stream_bodies.insert(request_id.clone(), body_tx);
+        (handle, target_peer_id, request_id, open_rx, body_rx)
+    };
+
+    let send_result = handle
+        .send_channel(proto::ChannelMessage {
+            channel: FLOCK_CHANNEL.to_string(),
+            source_peer_id: String::new(),
+            target_peer_id,
+            content_type: "application/octet-stream".to_string(),
+            body: Vec::new(),
+            message_kind: MESSAGE_KIND_HTTP_STREAM_REQUEST.to_string(),
+            correlation_id: request_id.clone(),
+            metadata_json: serde_json::to_string(&HttpProxyRequestMeta {
+                protocol_version: FLOCK_PROTOCOL_VERSION,
+                request_id: request_id.clone(),
+                method: "GET".to_string(),
+                path: path.to_string(),
+            })
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        })
+        .await;
+
+    if send_result.is_err() {
+        let mut state = state.lock().await;
+        state.pending_stream_open.remove(&request_id);
+        state.pending_stream_bodies.remove(&request_id);
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    let open = match tokio::time::timeout(Duration::from_secs(3), open_rx).await {
+        Ok(Ok(open)) => open,
+        _ => {
+            let mut state = state.lock().await;
+            state.pending_stream_open.remove(&request_id);
+            state.pending_stream_bodies.remove(&request_id);
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+
+    let mut response_builder = Response::builder().status(
+        StatusCode::from_u16(open.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+    );
+    let content_type = open
+        .content_type
+        .as_deref()
+        .unwrap_or("text/event-stream");
+    response_builder =
+        response_builder.header(header::CONTENT_TYPE, HeaderValue::from_str(content_type).unwrap_or(HeaderValue::from_static("text/event-stream")));
+    response_builder = response_builder.header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response_builder = response_builder.header(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+
+    let body_stream = ReceiverStream::new(body_rx);
+    response_builder
+        .body(Body::from_stream(body_stream))
+        .map_err(|_| StatusCode::BAD_GATEWAY)
+}
+
+async fn proxy_request_to_selected_host(
+    state: &Arc<Mutex<PluginState>>,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
 ) -> Result<HttpProxyResponse> {
     let (handle, target_peer_id, request_id, receiver) = {
         let mut state = state.lock().await;
@@ -472,14 +697,14 @@ async fn proxy_status_to_selected_host(
             source_peer_id: String::new(),
             target_peer_id,
             content_type: "application/octet-stream".to_string(),
-            body: Vec::new(),
+            body,
             message_kind: MESSAGE_KIND_HTTP_REQUEST.to_string(),
             correlation_id: request_id.clone(),
             metadata_json: serde_json::to_string(&HttpProxyRequestMeta {
                 protocol_version: FLOCK_PROTOCOL_VERSION,
                 request_id: request_id.clone(),
-                method: "GET".to_string(),
-                path: "/status".to_string(),
+                method: method.to_string(),
+                path: path.to_string(),
             })?,
         })
         .await;
@@ -499,6 +724,26 @@ async fn proxy_status_to_selected_host(
             Err(anyhow::anyhow!("proxy status request timed out"))
         }
     }
+}
+
+fn response_with_content_type(
+    response: HttpProxyResponse,
+    content_type: Option<&'static str>,
+) -> Response {
+    let mut response_builder =
+        Response::builder().status(StatusCode::from_u16(response.status_code).unwrap_or(
+            StatusCode::BAD_GATEWAY,
+        ));
+    if let Some(content_type) = content_type {
+        response_builder =
+            response_builder.header(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    }
+    response_builder.body(Body::from(response.body)).unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::empty())
+            .expect("response")
+    })
 }
 
 fn select_proxy_host(state: &PluginState) -> Option<String> {
@@ -577,28 +822,147 @@ async fn send_local_advertisement(
 
 async fn forward_local_goosed_request(
     state: &Arc<Mutex<PluginState>>,
-    meta: &HttpProxyRequestMeta,
-    body: &[u8],
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
 ) -> Result<HttpProxyResponse> {
     let (port, secret) = {
         let mut state = state.lock().await;
         state.goosed.ensure_started().await?;
-        (state.goosed.snapshot(state.goosed.health_check().await).port, state.goosed.secret_key().to_string())
+        (
+            state.goosed.snapshot(state.goosed.health_check().await).port,
+            state.goosed.secret_key().to_string(),
+        )
     };
 
-    let method = reqwest::Method::from_bytes(meta.method.as_bytes())?;
-    let url = format!("http://127.0.0.1:{port}{}", meta.path);
+    let method = reqwest::Method::from_bytes(method.as_bytes())?;
+    let url = format!("http://127.0.0.1:{port}{path}");
     let client = reqwest::Client::new();
     let response = client
         .request(method, url)
         .header("X-Secret-Key", secret)
-        .body(body.to_vec())
+        .body(body)
         .send()
         .await?;
 
     let status_code = response.status().as_u16();
     let body = response.bytes().await?.to_vec();
     Ok(HttpProxyResponse { status_code, body })
+}
+
+fn spawn_local_goosed_stream(
+    state: Arc<Mutex<PluginState>>,
+    target_peer_id: String,
+    meta: HttpProxyRequestMeta,
+) {
+    tokio::spawn(async move {
+        let (port, secret, handle) = {
+            let mut state = state.lock().await;
+            if state.goosed.ensure_started().await.is_err() {
+                return;
+            }
+            let handle = match state.outbound.clone() {
+                Some(handle) => handle,
+                None => return,
+            };
+            (
+                state.goosed.snapshot(state.goosed.health_check().await).port,
+                state.goosed.secret_key().to_string(),
+                handle,
+            )
+        };
+
+        let url = format!("http://127.0.0.1:{port}{}", meta.path);
+        let client = reqwest::Client::new();
+        let response = match client
+            .get(url)
+            .header("X-Secret-Key", secret)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                let _ = handle
+                    .send_channel(proto::ChannelMessage {
+                        channel: FLOCK_CHANNEL.to_string(),
+                        source_peer_id: String::new(),
+                        target_peer_id,
+                        content_type: "application/octet-stream".to_string(),
+                        body: Vec::new(),
+                        message_kind: MESSAGE_KIND_HTTP_STREAM_CLOSE.to_string(),
+                        correlation_id: meta.request_id.clone(),
+                        metadata_json: serde_json::to_string(&HttpStreamClose {
+                            protocol_version: FLOCK_PROTOCOL_VERSION,
+                            request_id: meta.request_id,
+                        })
+                        .unwrap_or_default(),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        let open = HttpStreamOpen {
+            protocol_version: FLOCK_PROTOCOL_VERSION,
+            request_id: meta.request_id.clone(),
+            status_code: response.status().as_u16(),
+            content_type: response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string()),
+        };
+        let _ = handle
+            .send_channel(proto::ChannelMessage {
+                channel: FLOCK_CHANNEL.to_string(),
+                source_peer_id: String::new(),
+                target_peer_id: target_peer_id.clone(),
+                content_type: "application/octet-stream".to_string(),
+                body: Vec::new(),
+                message_kind: MESSAGE_KIND_HTTP_STREAM_OPEN.to_string(),
+                correlation_id: meta.request_id.clone(),
+                metadata_json: serde_json::to_string(&open).unwrap_or_default(),
+            })
+            .await;
+
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    let _ = handle
+                        .send_channel(proto::ChannelMessage {
+                            channel: FLOCK_CHANNEL.to_string(),
+                            source_peer_id: String::new(),
+                            target_peer_id: target_peer_id.clone(),
+                            content_type: "application/octet-stream".to_string(),
+                            body: chunk.to_vec(),
+                            message_kind: MESSAGE_KIND_HTTP_STREAM_CHUNK.to_string(),
+                            correlation_id: meta.request_id.clone(),
+                            metadata_json: String::new(),
+                        })
+                        .await;
+                }
+                Err(_) => break,
+            }
+        }
+
+        let _ = handle
+            .send_channel(proto::ChannelMessage {
+                channel: FLOCK_CHANNEL.to_string(),
+                source_peer_id: String::new(),
+                target_peer_id,
+                content_type: "application/octet-stream".to_string(),
+                body: Vec::new(),
+                message_kind: MESSAGE_KIND_HTTP_STREAM_CLOSE.to_string(),
+                correlation_id: meta.request_id.clone(),
+                metadata_json: serde_json::to_string(&HttpStreamClose {
+                    protocol_version: FLOCK_PROTOCOL_VERSION,
+                    request_id: meta.request_id,
+                })
+                .unwrap_or_default(),
+            })
+            .await;
+    });
 }
 
 fn apply_mesh_event(state: &mut PluginState, event: &proto::MeshEvent) -> Option<String> {
@@ -931,6 +1295,8 @@ mod tests {
             outbound: None,
             next_proxy_request_id: 1,
             pending_proxy_requests: HashMap::new(),
+            pending_stream_open: HashMap::new(),
+            pending_stream_bodies: HashMap::new(),
         };
 
         state.known_hosts.insert(
