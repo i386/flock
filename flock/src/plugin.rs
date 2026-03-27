@@ -3,7 +3,7 @@ use crate::goosed::{GoosedStatus, GoosedSupervisor};
 use anyhow::Result;
 use axum::{
     body::{Body, Bytes},
-    extract::{Path as AxumPath, State as AxumState},
+    extract::{OriginalUri, Path as AxumPath, State as AxumState},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
     routing::{get, post},
@@ -352,12 +352,24 @@ async fn ensure_local_http_server(state: Arc<Mutex<PluginState>>) -> Result<()> 
         .route("/status", get(http_status))
         .route("/features", get(http_features))
         .route("/config/read", post(http_config_read))
+        .route("/config/extensions", get(http_config_extensions))
         .route("/agent/start", post(http_agent_start))
         .route("/agent/resume", post(http_agent_resume))
+        .route("/agent/update_provider", post(http_agent_update_provider))
+        .route("/agent/add_extension", post(http_agent_add_extension))
+        .route("/agent/remove_extension", post(http_agent_remove_extension))
+        .route(
+            "/agent/update_working_dir",
+            post(http_agent_update_working_dir),
+        )
         .route(
             "/agent/update_from_session",
             post(http_agent_update_from_session),
         )
+        .route("/agent/tools", get(http_agent_tools))
+        .route("/agent/list_apps", get(http_agent_list_apps))
+        .route("/agent/read_resource", post(http_agent_read_resource))
+        .route("/agent/call_tool", post(http_agent_call_tool))
         .route("/sessions", get(http_list_sessions))
         .route("/sessions/insights", get(http_session_insights))
         .route("/sessions/{session_id}", get(http_get_session))
@@ -520,6 +532,12 @@ async fn http_config_read(
     proxy_json_write_route(&state, "POST", "/config/read", body.to_vec()).await
 }
 
+async fn http_config_extensions(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+) -> Result<Response, StatusCode> {
+    proxy_json_route(&state, "/config/extensions").await
+}
+
 async fn http_agent_start(
     AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
     body: Bytes,
@@ -549,6 +567,76 @@ async fn http_agent_update_from_session(
         false,
     )
     .await
+}
+
+async fn http_agent_update_provider(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    proxy_session_body_route(&state, "/agent/update_provider", body.to_vec()).await
+}
+
+async fn http_agent_add_extension(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    proxy_session_body_route(&state, "/agent/add_extension", body.to_vec()).await
+}
+
+async fn http_agent_remove_extension(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    proxy_session_body_route(&state, "/agent/remove_extension", body.to_vec()).await
+}
+
+async fn http_agent_update_working_dir(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    proxy_session_body_route(&state, "/agent/update_working_dir", body.to_vec()).await
+}
+
+async fn http_agent_read_resource(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    proxy_session_body_route(&state, "/agent/read_resource", body.to_vec()).await
+}
+
+async fn http_agent_call_tool(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    proxy_session_body_route(&state, "/agent/call_tool", body.to_vec()).await
+}
+
+async fn http_agent_tools(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    original_uri: OriginalUri,
+) -> Result<Response, StatusCode> {
+    proxy_session_query_route(&state, &path_and_query(&original_uri)).await
+}
+
+async fn http_agent_list_apps(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    original_uri: OriginalUri,
+) -> Result<Response, StatusCode> {
+    let path = path_and_query(&original_uri);
+    if let Some(session_id) = extract_session_id_from_query_path(&path) {
+        proxy_session_write_route(
+            &state,
+            &session_id,
+            "GET",
+            &path,
+            Vec::new(),
+            BTreeMap::new(),
+            true,
+        )
+        .await
+    } else {
+        proxy_json_route(&state, &path).await
+    }
 }
 
 async fn http_list_sessions(
@@ -845,6 +933,41 @@ async fn proxy_agent_resume_route(
     .await
 }
 
+async fn proxy_session_body_route(
+    state: &Arc<Mutex<PluginState>>,
+    path: &str,
+    body: Vec<u8>,
+) -> Result<Response, StatusCode> {
+    let session_id = extract_session_id_from_request(&body).ok_or(StatusCode::BAD_REQUEST)?;
+    proxy_session_write_route(
+        state,
+        &session_id,
+        "POST",
+        path,
+        body,
+        BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        true,
+    )
+    .await
+}
+
+async fn proxy_session_query_route(
+    state: &Arc<Mutex<PluginState>>,
+    path: &str,
+) -> Result<Response, StatusCode> {
+    let session_id = extract_session_id_from_query_path(path).ok_or(StatusCode::BAD_REQUEST)?;
+    proxy_session_write_route(
+        state,
+        &session_id,
+        "GET",
+        path,
+        Vec::new(),
+        BTreeMap::new(),
+        true,
+    )
+    .await
+}
+
 async fn proxy_session_route(
     state: &Arc<Mutex<PluginState>>,
     session_id: &str,
@@ -1068,6 +1191,19 @@ fn extract_session_id_from_request(body: &[u8]) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn extract_session_id_from_query_path(path: &str) -> Option<String> {
+    let query = path.split_once('?')?.1;
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next()?;
+        let value = parts.next().unwrap_or_default();
+        if key == "session_id" && !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 fn extract_session_id_from_response(body: &[u8]) -> Option<String> {
     let json: serde_json::Value = serde_json::from_slice(body).ok()?;
     json.get("id")
@@ -1093,6 +1229,14 @@ fn extract_forward_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
         }
     }
     forwarded
+}
+
+fn path_and_query(original_uri: &OriginalUri) -> String {
+    original_uri
+        .0
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| original_uri.0.path().to_string())
 }
 
 fn headers_from_map(headers: &BTreeMap<String, String>) -> reqwest::header::HeaderMap {
