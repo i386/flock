@@ -1,22 +1,19 @@
+mod config;
+mod plugin;
+
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use mesh_llm_plugin::{
-    plugin_server_info, PluginMetadata, PluginRuntime, PluginStartupPolicy, SimplePlugin,
-};
+use config::{default_working_dir, same_file, AppPaths, RoutingConfig};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const PLUGIN_ID: &str = "flock";
-const DEFAULT_LOCAL_PORT: i64 = 43123;
-const DEFAULT_PUBLISH_INTERVAL_SECS: i64 = 5;
-const DEFAULT_STALE_AFTER_SECS: i64 = 20;
-const DEFAULT_MAX_CPU_LOAD_PCT: i64 = 95;
-const DEFAULT_MAX_MEMORY_USED_PCT: i64 = 95;
-const DEFAULT_MIN_DISK_AVAILABLE_BYTES: i64 = 10 * 1024 * 1024 * 1024;
-const DEFAULT_WEIGHT_RTT: f64 = 1.0;
-const DEFAULT_WEIGHT_ACTIVE_CHATS: f64 = 15.0;
-const DEFAULT_WEIGHT_CPU_LOAD: f64 = 0.7;
-const DEFAULT_WEIGHT_MEMORY_USED: f64 = 0.5;
+use config::{
+    mesh_config_path, DEFAULT_LOCAL_PORT, DEFAULT_MAX_CPU_LOAD_PCT, DEFAULT_MAX_MEMORY_USED_PCT,
+    DEFAULT_MIN_DISK_AVAILABLE_BYTES, DEFAULT_PUBLISH_INTERVAL_SECS, DEFAULT_STALE_AFTER_SECS,
+    DEFAULT_WEIGHT_ACTIVE_CHATS, DEFAULT_WEIGHT_CPU_LOAD, DEFAULT_WEIGHT_MEMORY_USED,
+    DEFAULT_WEIGHT_RTT,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "flock")]
@@ -51,23 +48,9 @@ async fn main() -> Result<()> {
 }
 
 async fn run_plugin() -> Result<()> {
-    let plugin = SimplePlugin::new(
-        PluginMetadata::new(
-            PLUGIN_ID,
-            env!("CARGO_PKG_VERSION"),
-            plugin_server_info(
-                PLUGIN_ID,
-                env!("CARGO_PKG_VERSION"),
-                "Flock",
-                "Private-mesh Goose backend router",
-                Some("Routes Goose traffic over a private mesh to remote goosed instances."),
-            ),
-        )
-        .with_startup_policy(PluginStartupPolicy::PrivateMeshOnly),
-    )
-    .with_health(|_context| Box::pin(async move { Ok("ok".to_string()) }));
-
-    PluginRuntime::run(plugin).await
+    let config_path = mesh_config_path()?;
+    let routing = RoutingConfig::load(&config_path)?;
+    plugin::run_plugin(config_path, routing).await
 }
 
 fn install() -> Result<()> {
@@ -87,45 +70,13 @@ fn install() -> Result<()> {
 
 fn goose() -> Result<()> {
     let paths = AppPaths::resolve()?;
+    let routing = RoutingConfig::load(&paths.config_path)?;
     println!("`flock goose` is not implemented yet.");
     println!(
         "expected local flock endpoint: http://127.0.0.1:{}",
-        current_local_port(&paths.config_path).unwrap_or(DEFAULT_LOCAL_PORT as u16)
+        routing.local_port
     );
     Ok(())
-}
-
-struct AppPaths {
-    mesh_dir: PathBuf,
-    config_path: PathBuf,
-    installed_binary: PathBuf,
-    current_binary: PathBuf,
-}
-
-impl AppPaths {
-    fn resolve() -> Result<Self> {
-        let config_path = mesh_config_path()?;
-        let mesh_dir = config_path
-            .parent()
-            .ok_or_else(|| anyhow!("invalid mesh config path: {}", config_path.display()))?
-            .to_path_buf();
-
-        Ok(Self {
-            installed_binary: mesh_dir.join("flock"),
-            current_binary: std::env::current_exe().context("failed to resolve current executable")?,
-            mesh_dir,
-            config_path,
-        })
-    }
-}
-
-fn mesh_config_path() -> Result<PathBuf> {
-    if let Ok(override_path) = std::env::var("MESH_LLM_CONFIG") {
-        return Ok(PathBuf::from(override_path));
-    }
-
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("failed to determine home directory"))?;
-    Ok(home.join(".mesh-llm").join("config.toml"))
 }
 
 fn install_binary(paths: &AppPaths) -> Result<()> {
@@ -150,13 +101,6 @@ fn install_binary(paths: &AppPaths) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
 }
 
 fn write_or_update_config(paths: &AppPaths) -> Result<()> {
@@ -274,27 +218,6 @@ fn ensure_routing_defaults(root: &mut toml::Value, working_dir: &Path) {
         "weight_memory_used",
         DEFAULT_WEIGHT_MEMORY_USED,
     );
-}
-
-fn default_working_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("failed to determine home directory"))?;
-    let code_dir = home.join("code");
-    if code_dir.exists() {
-        Ok(code_dir)
-    } else {
-        Ok(home)
-    }
-}
-
-fn current_local_port(config_path: &Path) -> Option<u16> {
-    let contents = fs::read_to_string(config_path).ok()?;
-    let root = contents.parse::<toml::Value>().ok()?;
-    let port = root
-        .get("flock")?
-        .get("routing")?
-        .get("local_port")?
-        .as_integer()?;
-    u16::try_from(port).ok()
 }
 
 fn insert_default_string(table: &mut toml::map::Map<String, toml::Value>, key: &str, value: String) {

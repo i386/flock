@@ -310,6 +310,8 @@ dependencies = [
  "mesh-llm-plugin",
  "rmcp",
  "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "toml",
 ]
