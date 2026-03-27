@@ -119,6 +119,19 @@ struct HttpStreamClose {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionListEnvelope {
+    sessions: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionInsightsEnvelope {
+    total_sessions: usize,
+    total_tokens: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct NodeAdvertisement {
     protocol_version: u32,
     plugin_version: String,
@@ -642,13 +655,13 @@ async fn http_agent_list_apps(
 async fn http_list_sessions(
     AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
 ) -> Result<Response, StatusCode> {
-    proxy_json_route(&state, "/sessions").await
+    aggregate_sessions_route(&state).await
 }
 
 async fn http_session_insights(
     AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
 ) -> Result<Response, StatusCode> {
-    proxy_json_route(&state, "/sessions/insights").await
+    aggregate_session_insights_route(&state).await
 }
 
 async fn http_get_session(
@@ -951,6 +964,122 @@ async fn proxy_session_body_route(
     .await
 }
 
+async fn aggregate_sessions_route(state: &Arc<Mutex<PluginState>>) -> Result<Response, StatusCode> {
+    let targets = candidate_targets(state).await;
+    let mut merged = BTreeMap::<String, serde_json::Value>::new();
+
+    for target in targets {
+        let response = if target == LOCAL_BINDING_ID {
+            forward_local_goosed_request(state, "GET", "/sessions", Vec::new(), &BTreeMap::new())
+                .await
+        } else {
+            proxy_request_to_host(
+                state,
+                target.clone(),
+                "GET",
+                "/sessions",
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+        };
+
+        let Ok(response) = response else { continue };
+        if response.status_code >= 400 {
+            continue;
+        }
+
+        let Ok(envelope) = serde_json::from_slice::<SessionListEnvelope>(&response.body) else {
+            continue;
+        };
+
+        for session in envelope.sessions {
+            let Some(session_id) = session
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+            else {
+                continue;
+            };
+            merged.insert(session_id.clone(), session);
+            let mut state = state.lock().await;
+            state.session_bindings.insert(session_id, target.clone());
+        }
+    }
+
+    let body = serde_json::to_vec(&SessionListEnvelope {
+        sessions: merged.into_values().collect(),
+    })
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(response_with_content_type(
+        HttpProxyResponse {
+            status_code: 200,
+            body,
+            content_type: Some("application/json".to_string()),
+        },
+        Some("application/json"),
+    ))
+}
+
+async fn aggregate_session_insights_route(
+    state: &Arc<Mutex<PluginState>>,
+) -> Result<Response, StatusCode> {
+    let targets = candidate_targets(state).await;
+    let mut total_sessions = 0usize;
+    let mut total_tokens = 0i64;
+
+    for target in targets {
+        let response = if target == LOCAL_BINDING_ID {
+            forward_local_goosed_request(
+                state,
+                "GET",
+                "/sessions/insights",
+                Vec::new(),
+                &BTreeMap::new(),
+            )
+            .await
+        } else {
+            proxy_request_to_host(
+                state,
+                target,
+                "GET",
+                "/sessions/insights",
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+        };
+
+        let Ok(response) = response else { continue };
+        if response.status_code >= 400 {
+            continue;
+        }
+
+        let Ok(insights) = serde_json::from_slice::<SessionInsightsEnvelope>(&response.body) else {
+            continue;
+        };
+
+        total_sessions += insights.total_sessions;
+        total_tokens += insights.total_tokens;
+    }
+
+    let body = serde_json::to_vec(&SessionInsightsEnvelope {
+        total_sessions,
+        total_tokens,
+    })
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(response_with_content_type(
+        HttpProxyResponse {
+            status_code: 200,
+            body,
+            content_type: Some("application/json".to_string()),
+        },
+        Some("application/json"),
+    ))
+}
+
 async fn proxy_session_query_route(
     state: &Arc<Mutex<PluginState>>,
     path: &str,
@@ -1152,6 +1281,25 @@ fn select_proxy_host(state: &PluginState) -> Option<String> {
                 .unwrap_or(false)
         })
         .map(|(peer_id, _)| peer_id.clone())
+}
+
+async fn candidate_targets(state: &Arc<Mutex<PluginState>>) -> Vec<String> {
+    let state = state.lock().await;
+    let mut targets = Vec::new();
+    targets.push(LOCAL_BINDING_ID.to_string());
+    targets.extend(
+        state
+            .known_hosts
+            .iter()
+            .filter(|(_, host)| {
+                host.advertisement
+                    .as_ref()
+                    .map(|value| value.goosed.healthy)
+                    .unwrap_or(false)
+            })
+            .map(|(peer_id, _)| peer_id.clone()),
+    );
+    targets
 }
 
 async fn resolve_session_target(
