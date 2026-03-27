@@ -4,7 +4,7 @@ use anyhow::Result;
 use axum::{
     body::{Body, Bytes},
     extract::{Path as AxumPath, State as AxumState},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
     routing::{get, post},
     Json, Router,
@@ -35,6 +35,7 @@ const MESSAGE_KIND_HTTP_STREAM_REQUEST: &str = "flock.http.stream_request.v1";
 const MESSAGE_KIND_HTTP_STREAM_OPEN: &str = "flock.http.stream_open.v1";
 const MESSAGE_KIND_HTTP_STREAM_CHUNK: &str = "flock.http.stream_chunk.v1";
 const MESSAGE_KIND_HTTP_STREAM_CLOSE: &str = "flock.http.stream_close.v1";
+const LOCAL_BINDING_ID: &str = "__local__";
 
 pub struct PluginState {
     config_path: PathBuf,
@@ -85,6 +86,7 @@ struct HttpProxyRequestMeta {
     request_id: String,
     method: String,
     path: String,
+    headers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -92,12 +94,14 @@ struct HttpProxyResponseMeta {
     protocol_version: u32,
     request_id: String,
     status_code: u16,
+    content_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct HttpProxyResponse {
     status_code: u16,
     body: Vec<u8>,
+    content_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -346,6 +350,14 @@ async fn ensure_local_http_server(state: Arc<Mutex<PluginState>>) -> Result<()> 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let app = Router::new()
         .route("/status", get(http_status))
+        .route("/features", get(http_features))
+        .route("/config/read", post(http_config_read))
+        .route("/agent/start", post(http_agent_start))
+        .route("/agent/resume", post(http_agent_resume))
+        .route(
+            "/agent/update_from_session",
+            post(http_agent_update_from_session),
+        )
         .route("/sessions", get(http_list_sessions))
         .route("/sessions/insights", get(http_session_insights))
         .route("/sessions/{session_id}", get(http_get_session))
@@ -390,11 +402,21 @@ async fn handle_channel_message(
         }
         MESSAGE_KIND_HTTP_REQUEST => {
             let meta: HttpProxyRequestMeta = serde_json::from_str(&message.metadata_json)?;
-            let response =
-                forward_local_goosed_request(state, &meta.method, &meta.path, message.body).await;
-            let (status_code, body) = match response {
-                Ok(value) => (value.status_code, value.body),
-                Err(error) => (502, error.to_string().into_bytes()),
+            let response = forward_local_goosed_request(
+                state,
+                &meta.method,
+                &meta.path,
+                message.body,
+                &meta.headers,
+            )
+            .await;
+            let (status_code, content_type, body) = match response {
+                Ok(value) => (value.status_code, value.content_type, value.body),
+                Err(error) => (
+                    502,
+                    Some("text/plain; charset=utf-8".to_string()),
+                    error.to_string().into_bytes(),
+                ),
             };
 
             context
@@ -410,6 +432,7 @@ async fn handle_channel_message(
                         protocol_version: FLOCK_PROTOCOL_VERSION,
                         request_id: meta.request_id,
                         status_code,
+                        content_type,
                     })?,
                 })
                 .await
@@ -421,6 +444,7 @@ async fn handle_channel_message(
                 let _ = sender.send(HttpProxyResponse {
                     status_code: meta.status_code,
                     body: message.body,
+                    content_type: meta.content_type,
                 });
             }
             Ok(())
@@ -463,7 +487,9 @@ async fn handle_channel_message(
 async fn http_status(
     AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
 ) -> Result<(StatusCode, String), StatusCode> {
-    match proxy_request_to_selected_host(&state, "GET", "/status", Vec::new()).await {
+    match proxy_request_to_selected_host(&state, "GET", "/status", Vec::new(), BTreeMap::new())
+        .await
+    {
         Ok(response) => Ok((
             StatusCode::from_u16(response.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
             String::from_utf8_lossy(&response.body).into_owned(),
@@ -479,6 +505,50 @@ async fn http_status(
             }
         }
     }
+}
+
+async fn http_features(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+) -> Result<Response, StatusCode> {
+    proxy_json_route(&state, "/features").await
+}
+
+async fn http_config_read(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    proxy_json_write_route(&state, "POST", "/config/read", body.to_vec()).await
+}
+
+async fn http_agent_start(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    proxy_agent_start_route(&state, body.to_vec()).await
+}
+
+async fn http_agent_resume(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    proxy_agent_resume_route(&state, body.to_vec()).await
+}
+
+async fn http_agent_update_from_session(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    let session_id = extract_session_id_from_request(&body).ok_or(StatusCode::BAD_REQUEST)?;
+    proxy_session_write_route(
+        &state,
+        &session_id,
+        "POST",
+        "/agent/update_from_session",
+        body.to_vec(),
+        BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        false,
+    )
+    .await
 }
 
 async fn http_list_sessions(
@@ -497,7 +567,7 @@ async fn http_get_session(
     AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
     AxumPath(session_id): AxumPath<String>,
 ) -> Result<Response, StatusCode> {
-    proxy_json_route(&state, &format!("/sessions/{session_id}")).await
+    proxy_session_route(&state, &session_id, &format!("/sessions/{session_id}")).await
 }
 
 async fn http_session_reply(
@@ -505,7 +575,16 @@ async fn http_session_reply(
     AxumPath(session_id): AxumPath<String>,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
-    proxy_json_write_route(&state, "POST", &format!("/sessions/{session_id}/reply"), body.to_vec()).await
+    proxy_session_write_route(
+        &state,
+        &session_id,
+        "POST",
+        &format!("/sessions/{session_id}/reply"),
+        body.to_vec(),
+        BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        true,
+    )
+    .await
 }
 
 async fn http_session_cancel(
@@ -513,14 +592,30 @@ async fn http_session_cancel(
     AxumPath(session_id): AxumPath<String>,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
-    proxy_write_route(&state, "POST", &format!("/sessions/{session_id}/cancel"), body.to_vec()).await
+    proxy_session_write_route(
+        &state,
+        &session_id,
+        "POST",
+        &format!("/sessions/{session_id}/cancel"),
+        body.to_vec(),
+        BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        true,
+    )
+    .await
 }
 
 async fn http_session_events(
     AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
     AxumPath(session_id): AxumPath<String>,
+    headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    proxy_event_stream_route(&state, &format!("/sessions/{session_id}/events")).await
+    proxy_event_stream_route(
+        &state,
+        &session_id,
+        &format!("/sessions/{session_id}/events"),
+        extract_forward_headers(&headers),
+    )
+    .await
 }
 
 async fn http_flock_health(
@@ -570,25 +665,17 @@ async fn proxy_json_write_route(
     path: &str,
     body: Vec<u8>,
 ) -> Result<Response, StatusCode> {
-    match proxy_request_to_selected_host(state, method, path, body.clone()).await {
-        Ok(response) => Ok(response_with_content_type(response, Some("application/json"))),
-        Err(_) => match forward_local_goosed_request(state, method, path, body).await {
-            Ok(response) => Ok(response_with_content_type(response, Some("application/json"))),
-            Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
-        },
-    }
-}
-
-async fn proxy_write_route(
-    state: &Arc<Mutex<PluginState>>,
-    method: &str,
-    path: &str,
-    body: Vec<u8>,
-) -> Result<Response, StatusCode> {
-    match proxy_request_to_selected_host(state, method, path, body.clone()).await {
-        Ok(response) => Ok(response_with_content_type(response, None)),
-        Err(_) => match forward_local_goosed_request(state, method, path, body).await {
-            Ok(response) => Ok(response_with_content_type(response, None)),
+    let headers = BTreeMap::from([("content-type".to_string(), "application/json".to_string())]);
+    match proxy_request_to_selected_host(state, method, path, body.clone(), headers.clone()).await {
+        Ok(response) => Ok(response_with_content_type(
+            response,
+            Some("application/json"),
+        )),
+        Err(_) => match forward_local_goosed_request(state, method, path, body, &headers).await {
+            Ok(response) => Ok(response_with_content_type(
+                response,
+                Some("application/json"),
+            )),
             Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
         },
     }
@@ -596,29 +683,35 @@ async fn proxy_write_route(
 
 async fn proxy_event_stream_route(
     state: &Arc<Mutex<PluginState>>,
+    session_id: &str,
     path: &str,
+    headers: BTreeMap<String, String>,
 ) -> Result<Response, StatusCode> {
-    let (handle, target_peer_id, request_id, open_rx, body_rx) = {
+    let target_peer_id = resolve_session_target(state, session_id).await?;
+    let (handle, request_id, open_rx, body_rx) = {
         let mut state = state.lock().await;
         let handle = state
             .outbound
             .clone()
             .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-        let target_peer_id = select_proxy_host(&state).ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
         let request_id = format!("stream-{}", state.next_proxy_request_id);
         state.next_proxy_request_id += 1;
         let (open_tx, open_rx) = oneshot::channel();
         let (body_tx, body_rx) = mpsc::channel(128);
-        state.pending_stream_open.insert(request_id.clone(), open_tx);
-        state.pending_stream_bodies.insert(request_id.clone(), body_tx);
-        (handle, target_peer_id, request_id, open_rx, body_rx)
+        state
+            .pending_stream_open
+            .insert(request_id.clone(), open_tx);
+        state
+            .pending_stream_bodies
+            .insert(request_id.clone(), body_tx);
+        (handle, request_id, open_rx, body_rx)
     };
 
     let send_result = handle
         .send_channel(proto::ChannelMessage {
             channel: FLOCK_CHANNEL.to_string(),
             source_peer_id: String::new(),
-            target_peer_id,
+            target_peer_id: target_peer_id.clone(),
             content_type: "application/octet-stream".to_string(),
             body: Vec::new(),
             message_kind: MESSAGE_KIND_HTTP_STREAM_REQUEST.to_string(),
@@ -628,6 +721,7 @@ async fn proxy_event_stream_route(
                 request_id: request_id.clone(),
                 method: "GET".to_string(),
                 path: path.to_string(),
+                headers,
             })
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         })
@@ -650,17 +744,25 @@ async fn proxy_event_stream_route(
         }
     };
 
-    let mut response_builder = Response::builder().status(
-        StatusCode::from_u16(open.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+    if open.status_code < 400 {
+        let mut state = state.lock().await;
+        state
+            .session_bindings
+            .insert(session_id.to_string(), target_peer_id);
+    }
+
+    let mut response_builder = Response::builder()
+        .status(StatusCode::from_u16(open.status_code).unwrap_or(StatusCode::BAD_GATEWAY));
+    let content_type = open.content_type.as_deref().unwrap_or("text/event-stream");
+    response_builder = response_builder.header(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .unwrap_or(HeaderValue::from_static("text/event-stream")),
     );
-    let content_type = open
-        .content_type
-        .as_deref()
-        .unwrap_or("text/event-stream");
     response_builder =
-        response_builder.header(header::CONTENT_TYPE, HeaderValue::from_str(content_type).unwrap_or(HeaderValue::from_static("text/event-stream")));
-    response_builder = response_builder.header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    response_builder = response_builder.header(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        response_builder.header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response_builder =
+        response_builder.header(header::CONNECTION, HeaderValue::from_static("keep-alive"));
 
     let body_stream = ReceiverStream::new(body_rx);
     response_builder
@@ -668,11 +770,152 @@ async fn proxy_event_stream_route(
         .map_err(|_| StatusCode::BAD_GATEWAY)
 }
 
+async fn proxy_agent_start_route(
+    state: &Arc<Mutex<PluginState>>,
+    body: Vec<u8>,
+) -> Result<Response, StatusCode> {
+    let remote_target = {
+        let state = state.lock().await;
+        select_proxy_host(&state)
+    };
+
+    if let Some(target_peer_id) = remote_target {
+        if let Ok(response) = proxy_request_to_host(
+            state,
+            target_peer_id.clone(),
+            "POST",
+            "/agent/start",
+            body.clone(),
+            BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        )
+        .await
+        {
+            if let Some(session_id) = extract_session_id_from_response(&response.body) {
+                let mut state = state.lock().await;
+                state.session_bindings.insert(session_id, target_peer_id);
+                state.next_chat_target = None;
+            }
+            return Ok(response_with_content_type(
+                response,
+                Some("application/json"),
+            ));
+        }
+    }
+
+    match forward_local_goosed_request(
+        state,
+        "POST",
+        "/agent/start",
+        body,
+        &BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+    )
+    .await
+    {
+        Ok(response) => {
+            if let Some(session_id) = extract_session_id_from_response(&response.body) {
+                let mut state = state.lock().await;
+                state
+                    .session_bindings
+                    .insert(session_id, LOCAL_BINDING_ID.to_string());
+                state.next_chat_target = None;
+            }
+            Ok(response_with_content_type(
+                response,
+                Some("application/json"),
+            ))
+        }
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+async fn proxy_agent_resume_route(
+    state: &Arc<Mutex<PluginState>>,
+    body: Vec<u8>,
+) -> Result<Response, StatusCode> {
+    let session_id = extract_session_id_from_request(&body).ok_or(StatusCode::BAD_REQUEST)?;
+    proxy_session_write_route(
+        state,
+        &session_id,
+        "POST",
+        "/agent/resume",
+        body,
+        BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        true,
+    )
+    .await
+}
+
+async fn proxy_session_route(
+    state: &Arc<Mutex<PluginState>>,
+    session_id: &str,
+    path: &str,
+) -> Result<Response, StatusCode> {
+    proxy_session_write_route(
+        state,
+        session_id,
+        "GET",
+        path,
+        Vec::new(),
+        BTreeMap::new(),
+        true,
+    )
+    .await
+}
+
+async fn proxy_session_write_route(
+    state: &Arc<Mutex<PluginState>>,
+    session_id: &str,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+    headers: BTreeMap<String, String>,
+    bind_on_success: bool,
+) -> Result<Response, StatusCode> {
+    let target = resolve_session_target(state, session_id).await?;
+
+    let response = if target == LOCAL_BINDING_ID {
+        forward_local_goosed_request(state, method, path, body, &headers)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    } else {
+        proxy_request_to_host(state, target.clone(), method, path, body, headers)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    };
+
+    if bind_on_success && response.status_code < 400 {
+        let mut state = state.lock().await;
+        state
+            .session_bindings
+            .insert(session_id.to_string(), target.clone());
+    }
+
+    Ok(response_with_content_type(response, None))
+}
+
 async fn proxy_request_to_selected_host(
     state: &Arc<Mutex<PluginState>>,
     method: &str,
     path: &str,
     body: Vec<u8>,
+    headers: BTreeMap<String, String>,
+) -> Result<HttpProxyResponse> {
+    let target_peer_id = {
+        let state = state.lock().await;
+        select_proxy_host(&state)
+            .ok_or_else(|| anyhow::anyhow!("no healthy remote flock host available"))?
+    };
+
+    proxy_request_to_host(state, target_peer_id, method, path, body, headers).await
+}
+
+async fn proxy_request_to_host(
+    state: &Arc<Mutex<PluginState>>,
+    target_peer_id: String,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+    headers: BTreeMap<String, String>,
 ) -> Result<HttpProxyResponse> {
     let (handle, target_peer_id, request_id, receiver) = {
         let mut state = state.lock().await;
@@ -680,8 +923,6 @@ async fn proxy_request_to_selected_host(
             .outbound
             .clone()
             .ok_or_else(|| anyhow::anyhow!("flock plugin outbound handle not initialized"))?;
-        let target_peer_id = select_proxy_host(&state)
-            .ok_or_else(|| anyhow::anyhow!("no healthy remote flock host available"))?;
         let request_id = format!("status-{}", state.next_proxy_request_id);
         state.next_proxy_request_id += 1;
         let (sender, receiver) = oneshot::channel();
@@ -705,6 +946,7 @@ async fn proxy_request_to_selected_host(
                 request_id: request_id.clone(),
                 method: method.to_string(),
                 path: path.to_string(),
+                headers,
             })?,
         })
         .await;
@@ -730,20 +972,24 @@ fn response_with_content_type(
     response: HttpProxyResponse,
     content_type: Option<&'static str>,
 ) -> Response {
-    let mut response_builder =
-        Response::builder().status(StatusCode::from_u16(response.status_code).unwrap_or(
-            StatusCode::BAD_GATEWAY,
-        ));
-    if let Some(content_type) = content_type {
-        response_builder =
-            response_builder.header(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    let mut response_builder = Response::builder()
+        .status(StatusCode::from_u16(response.status_code).unwrap_or(StatusCode::BAD_GATEWAY));
+    let response_content_type = content_type
+        .map(|value| value.to_string())
+        .or(response.content_type.clone());
+    if let Some(content_type) = response_content_type.as_deref() {
+        if let Ok(content_type) = HeaderValue::from_str(content_type) {
+            response_builder = response_builder.header(header::CONTENT_TYPE, content_type);
+        }
     }
-    response_builder.body(Body::from(response.body)).unwrap_or_else(|_| {
-        Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::empty())
-            .expect("response")
-    })
+    response_builder
+        .body(Body::from(response.body))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::empty())
+                .expect("response")
+        })
 }
 
 fn select_proxy_host(state: &PluginState) -> Option<String> {
@@ -783,6 +1029,83 @@ fn select_proxy_host(state: &PluginState) -> Option<String> {
                 .unwrap_or(false)
         })
         .map(|(peer_id, _)| peer_id.clone())
+}
+
+async fn resolve_session_target(
+    state: &Arc<Mutex<PluginState>>,
+    session_id: &str,
+) -> Result<String, StatusCode> {
+    let state = state.lock().await;
+    if let Some(target) = state.session_bindings.get(session_id) {
+        if target == LOCAL_BINDING_ID {
+            return Ok(target.clone());
+        }
+        if host_is_healthy(&state, target) {
+            return Ok(target.clone());
+        }
+    }
+
+    if let Some(target) = select_proxy_host(&state) {
+        return Ok(target);
+    }
+
+    Ok(LOCAL_BINDING_ID.to_string())
+}
+
+fn host_is_healthy(state: &PluginState, peer_id: &str) -> bool {
+    state
+        .known_hosts
+        .get(peer_id)
+        .and_then(|host| host.advertisement.as_ref())
+        .map(|advertisement| advertisement.goosed.healthy)
+        .unwrap_or(false)
+}
+
+fn extract_session_id_from_request(body: &[u8]) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+    json.get("session_id")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+}
+
+fn extract_session_id_from_response(body: &[u8]) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+    json.get("id")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .or_else(|| {
+            json.get("session")
+                .and_then(|value| value.get("id"))
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+        })
+}
+
+fn extract_forward_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
+    let mut forwarded = BTreeMap::new();
+    let last_event_id = header::HeaderName::from_static("last-event-id");
+    for header_name in [&header::ACCEPT, &header::CONTENT_TYPE, &last_event_id] {
+        if let Some(value) = headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+        {
+            forwarded.insert(header_name.as_str().to_string(), value.to_string());
+        }
+    }
+    forwarded
+}
+
+fn headers_from_map(headers: &BTreeMap<String, String>) -> reqwest::header::HeaderMap {
+    let mut result = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(value),
+        ) {
+            result.insert(name, value);
+        }
+    }
+    result
 }
 
 fn source_peer_id(message: &proto::ChannelMessage, advertisement: &NodeAdvertisement) -> String {
@@ -825,12 +1148,16 @@ async fn forward_local_goosed_request(
     method: &str,
     path: &str,
     body: Vec<u8>,
+    headers: &BTreeMap<String, String>,
 ) -> Result<HttpProxyResponse> {
     let (port, secret) = {
         let mut state = state.lock().await;
         state.goosed.ensure_started().await?;
         (
-            state.goosed.snapshot(state.goosed.health_check().await).port,
+            state
+                .goosed
+                .snapshot(state.goosed.health_check().await)
+                .port,
             state.goosed.secret_key().to_string(),
         )
     };
@@ -838,16 +1165,24 @@ async fn forward_local_goosed_request(
     let method = reqwest::Method::from_bytes(method.as_bytes())?;
     let url = format!("http://127.0.0.1:{port}{path}");
     let client = reqwest::Client::new();
-    let response = client
-        .request(method, url)
-        .header("X-Secret-Key", secret)
-        .body(body)
-        .send()
-        .await?;
+    let mut request = client.request(method, url).header("X-Secret-Key", secret);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request.body(body).send().await?;
 
     let status_code = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
     let body = response.bytes().await?.to_vec();
-    Ok(HttpProxyResponse { status_code, body })
+    Ok(HttpProxyResponse {
+        status_code,
+        body,
+        content_type,
+    })
 }
 
 fn spawn_local_goosed_stream(
@@ -866,7 +1201,10 @@ fn spawn_local_goosed_stream(
                 None => return,
             };
             (
-                state.goosed.snapshot(state.goosed.health_check().await).port,
+                state
+                    .goosed
+                    .snapshot(state.goosed.health_check().await)
+                    .port,
                 state.goosed.secret_key().to_string(),
                 handle,
             )
@@ -877,6 +1215,7 @@ fn spawn_local_goosed_stream(
         let response = match client
             .get(url)
             .header("X-Secret-Key", secret)
+            .headers(headers_from_map(&meta.headers))
             .send()
             .await
         {
