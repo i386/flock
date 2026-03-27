@@ -229,13 +229,26 @@ pub async fn run_plugin(config_path: PathBuf, routing: RoutingConfig) -> Result<
             Ok(())
         })
     })
-    .with_health(move |_context| {
+    .with_health(move |context| {
         let state = health_state.clone();
         Box::pin(async move {
             let mut state = state.lock().await;
             state.goosed.ensure_started().await?;
             refresh_local_advertisement(&mut state).await;
-            Ok(health_json(&state)?.to_string())
+            let advertisement = state.local.last_advertisement.clone();
+            let detail = health_json(&state)?.to_string();
+            drop(state);
+            if let Some(advertisement) = advertisement {
+                context
+                    .send_json_channel(
+                        FLOCK_CHANNEL,
+                        String::new(),
+                        MESSAGE_KIND_ADVERTISEMENT,
+                        &advertisement,
+                    )
+                    .await?;
+            }
+            Ok(detail)
         })
     })
     .on_mesh_event(move |event, context| {
