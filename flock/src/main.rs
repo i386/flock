@@ -1,13 +1,17 @@
 mod config;
+mod goosed;
 mod plugin;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use config::{default_working_dir, same_file, AppPaths, RoutingConfig};
+use serde_json::json;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 const PLUGIN_ID: &str = "flock";
+const DEFAULT_LOCAL_SECRET: &str = "flock-local";
 use config::{
     mesh_config_path, DEFAULT_LOCAL_PORT, DEFAULT_MAX_CPU_LOAD_PCT, DEFAULT_MAX_MEMORY_USED_PCT,
     DEFAULT_MIN_DISK_AVAILABLE_BYTES, DEFAULT_PUBLISH_INTERVAL_SECS, DEFAULT_STALE_AFTER_SECS,
@@ -43,7 +47,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Install) => install(),
         Some(Command::Goose) => goose(),
-        None => Err(anyhow!("no command provided; use `flock install`, `flock goose`, or `flock --plugin`")),
+        None => Err(anyhow!(
+            "no command provided; use `flock install`, `flock goose`, or `flock --plugin`"
+        )),
     }
 }
 
@@ -71,11 +77,113 @@ fn install() -> Result<()> {
 fn goose() -> Result<()> {
     let paths = AppPaths::resolve()?;
     let routing = RoutingConfig::load(&paths.config_path)?;
-    println!("`flock goose` is not implemented yet.");
+    let settings_path = goose_settings_path()?;
+    configure_goose_external_backend(&settings_path, routing.local_port, DEFAULT_LOCAL_SECRET)?;
+
     println!(
-        "expected local flock endpoint: http://127.0.0.1:{}",
+        "configured Goose external backend at {}",
+        settings_path.display()
+    );
+    println!(
+        "Goose will use http://127.0.0.1:{} with a local flock secret",
         routing.local_port
     );
+    println!("mesh-llm with flock plugin mode must be running for the endpoint to respond");
+
+    launch_goose_if_available()?;
+    Ok(())
+}
+
+fn goose_settings_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("failed to determine home directory"))?;
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(home
+            .join("Library")
+            .join("Application Support")
+            .join("Goose")
+            .join("settings.json"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(xdg_config_home) = std::env::var("XDG_CONFIG_HOME") {
+            return Ok(PathBuf::from(xdg_config_home)
+                .join("Goose")
+                .join("settings.json"));
+        }
+        return Ok(home.join(".config").join("Goose").join("settings.json"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return Ok(PathBuf::from(appdata).join("Goose").join("settings.json"));
+        }
+        return Ok(home
+            .join("AppData")
+            .join("Roaming")
+            .join("Goose")
+            .join("settings.json"));
+    }
+
+    #[allow(unreachable_code)]
+    Ok(home.join(".config").join("Goose").join("settings.json"))
+}
+
+fn configure_goose_external_backend(
+    settings_path: &Path,
+    local_port: u16,
+    secret: &str,
+) -> Result<()> {
+    if let Some(parent) = settings_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let mut root = if settings_path.exists() {
+        let contents = fs::read_to_string(settings_path)
+            .with_context(|| format!("failed to read {}", settings_path.display()))?;
+        serde_json::from_str::<serde_json::Value>(&contents)
+            .with_context(|| format!("failed to parse {}", settings_path.display()))?
+    } else {
+        json!({})
+    };
+
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Goose settings file must contain a top-level JSON object"))?;
+    object.insert(
+        "externalGoosed".to_string(),
+        json!({
+            "enabled": true,
+            "url": format!("http://127.0.0.1:{local_port}"),
+            "secret": secret,
+        }),
+    );
+
+    fs::write(settings_path, serde_json::to_string_pretty(&root)?)
+        .with_context(|| format!("failed to write {}", settings_path.display()))?;
+    Ok(())
+}
+
+fn launch_goose_if_available() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = ProcessCommand::new("open").arg("-a").arg("Goose").status();
+        match status {
+            Ok(status) if status.success() => {
+                println!("launched Goose");
+                return Ok(());
+            }
+            Ok(_) | Err(_) => {
+                println!("Goose app was not launched automatically");
+                return Ok(());
+            }
+        }
+    }
+
+    #[allow(unreachable_code)]
     Ok(())
 }
 
@@ -135,17 +243,15 @@ fn ensure_plugin_entry(root: &mut toml::Value, installed_binary: &Path) -> Resul
         .as_array_mut()
         .ok_or_else(|| anyhow!("`plugin` must be an array of tables"))?;
 
-    let plugin_table = plugins
-        .iter_mut()
-        .find_map(|entry| {
-            let table = entry.as_table_mut()?;
-            let name = table.get("name")?.as_str()?;
-            if name == PLUGIN_ID {
-                Some(table)
-            } else {
-                None
-            }
-        });
+    let plugin_table = plugins.iter_mut().find_map(|entry| {
+        let table = entry.as_table_mut()?;
+        let name = table.get("name")?.as_str()?;
+        if name == PLUGIN_ID {
+            Some(table)
+        } else {
+            None
+        }
+    });
 
     let plugin_table = match plugin_table {
         Some(table) => table,
@@ -187,7 +293,11 @@ fn ensure_routing_defaults(root: &mut toml::Value, working_dir: &Path) {
         .as_table_mut()
         .expect("flock.routing must be a table");
 
-    insert_default_int(routing, "publish_interval_secs", DEFAULT_PUBLISH_INTERVAL_SECS);
+    insert_default_int(
+        routing,
+        "publish_interval_secs",
+        DEFAULT_PUBLISH_INTERVAL_SECS,
+    );
     insert_default_int(routing, "stale_after_secs", DEFAULT_STALE_AFTER_SECS);
     insert_default_int(routing, "local_port", DEFAULT_LOCAL_PORT);
     insert_default_string(routing, "working_dir", working_dir.display().to_string());
@@ -196,31 +306,23 @@ fn ensure_routing_defaults(root: &mut toml::Value, working_dir: &Path) {
     insert_default_string(routing, "default_host_preference", String::new());
     insert_default_bool(routing, "require_healthy_goosed", true);
     insert_default_int(routing, "max_cpu_load_pct", DEFAULT_MAX_CPU_LOAD_PCT);
-    insert_default_int(
-        routing,
-        "max_memory_used_pct",
-        DEFAULT_MAX_MEMORY_USED_PCT,
-    );
+    insert_default_int(routing, "max_memory_used_pct", DEFAULT_MAX_MEMORY_USED_PCT);
     insert_default_int(
         routing,
         "min_disk_available_bytes",
         DEFAULT_MIN_DISK_AVAILABLE_BYTES,
     );
     insert_default_float(routing, "weight_rtt", DEFAULT_WEIGHT_RTT);
-    insert_default_float(
-        routing,
-        "weight_active_chats",
-        DEFAULT_WEIGHT_ACTIVE_CHATS,
-    );
+    insert_default_float(routing, "weight_active_chats", DEFAULT_WEIGHT_ACTIVE_CHATS);
     insert_default_float(routing, "weight_cpu_load", DEFAULT_WEIGHT_CPU_LOAD);
-    insert_default_float(
-        routing,
-        "weight_memory_used",
-        DEFAULT_WEIGHT_MEMORY_USED,
-    );
+    insert_default_float(routing, "weight_memory_used", DEFAULT_WEIGHT_MEMORY_USED);
 }
 
-fn insert_default_string(table: &mut toml::map::Map<String, toml::Value>, key: &str, value: String) {
+fn insert_default_string(
+    table: &mut toml::map::Map<String, toml::Value>,
+    key: &str,
+    value: String,
+) {
     table
         .entry(key.to_string())
         .or_insert_with(|| toml::Value::String(value));
@@ -242,4 +344,29 @@ fn insert_default_float(table: &mut toml::map::Map<String, toml::Value>, key: &s
     table
         .entry(key.to_string())
         .or_insert_with(|| toml::Value::Float(value));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configure_goose_external_backend;
+    use std::fs;
+
+    #[test]
+    fn goose_external_backend_config_is_written() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let settings_path = temp.path().join("settings.json");
+
+        configure_goose_external_backend(&settings_path, 43123, "test-secret").expect("config");
+
+        let contents = fs::read_to_string(settings_path).expect("settings contents");
+        let parsed: serde_json::Value = serde_json::from_str(&contents).expect("json");
+        assert_eq!(
+            parsed["externalGoosed"],
+            serde_json::json!({
+                "enabled": true,
+                "url": "http://127.0.0.1:43123",
+                "secret": "test-secret",
+            })
+        );
+    }
 }

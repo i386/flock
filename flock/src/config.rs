@@ -32,7 +32,8 @@ impl AppPaths {
 
         Ok(Self {
             installed_binary: mesh_dir.join("flock"),
-            current_binary: std::env::current_exe().context("failed to resolve current executable")?,
+            current_binary: std::env::current_exe()
+                .context("failed to resolve current executable")?,
             mesh_dir,
             config_path,
         })

@@ -1,4 +1,5 @@
 use crate::config::RoutingConfig;
+use crate::goosed::{GoosedStatus, GoosedSupervisor};
 use anyhow::Result;
 use axum::{extract::State as AxumState, http::StatusCode, routing::get, Json, Router};
 use mesh_llm_plugin::{
@@ -31,6 +32,7 @@ pub struct PluginState {
     session_bindings: BTreeMap<String, String>,
     next_chat_target: Option<String>,
     http_server_started: bool,
+    goosed: GoosedSupervisor,
 }
 
 #[derive(Debug)]
@@ -67,6 +69,7 @@ struct NodeAdvertisement {
     hostname: String,
     display_name: String,
     local_port: u16,
+    goosed: GoosedStatus,
     working_dir: String,
     active_chat_count: usize,
     emitted_at_unix_ms: u64,
@@ -142,12 +145,15 @@ struct KnownHostSnapshot<'a> {
     capability_count: usize,
     hostname: Option<&'a str>,
     operating_system: Option<&'a str>,
+    goosed_healthy: Option<bool>,
+    goosed_version: Option<&'a str>,
     cpu_load_pct: Option<f32>,
     memory_used_pct: Option<f32>,
 }
 
 pub async fn run_plugin(config_path: PathBuf, routing: RoutingConfig) -> Result<()> {
     let hostname = detect_hostname();
+    let goosed = GoosedSupervisor::new(routing.local_port);
     let state = Arc::new(Mutex::new(PluginState {
         config_path,
         next_chat_target: routing.next_chat_target.clone(),
@@ -164,11 +170,12 @@ pub async fn run_plugin(config_path: PathBuf, routing: RoutingConfig) -> Result<
         known_hosts: BTreeMap::new(),
         session_bindings: BTreeMap::new(),
         http_server_started: false,
+        goosed,
     }));
 
     {
         let mut state = state.lock().await;
-        refresh_local_advertisement(&mut state);
+        refresh_local_advertisement(&mut state).await;
     }
 
     let initialize_state = state.clone();
@@ -203,6 +210,11 @@ pub async fn run_plugin(config_path: PathBuf, routing: RoutingConfig) -> Result<
         let state = initialized_state.clone();
         Box::pin(async move {
             ensure_local_http_server(state.clone()).await?;
+            {
+                let mut state = state.lock().await;
+                state.goosed.ensure_started().await?;
+                refresh_local_advertisement(&mut state).await;
+            }
             send_local_advertisement(&state, String::new(), context).await?;
             context
                 .send_json_channel(
@@ -221,7 +233,8 @@ pub async fn run_plugin(config_path: PathBuf, routing: RoutingConfig) -> Result<
         let state = health_state.clone();
         Box::pin(async move {
             let mut state = state.lock().await;
-            refresh_local_advertisement(&mut state);
+            state.goosed.ensure_started().await?;
+            refresh_local_advertisement(&mut state).await;
             Ok(health_json(&state)?.to_string())
         })
     })
@@ -307,7 +320,8 @@ async fn http_flock_health(
     AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let mut state = state.lock().await;
-    refresh_local_advertisement(&mut state);
+    let _ = state.goosed.ensure_started().await;
+    refresh_local_advertisement(&mut state).await;
     health_json(&state)
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -353,7 +367,8 @@ async fn send_local_advertisement(
 ) -> Result<()> {
     let advertisement = {
         let mut state = state.lock().await;
-        refresh_local_advertisement(&mut state);
+        state.goosed.ensure_started().await?;
+        refresh_local_advertisement(&mut state).await;
         state.local.last_advertisement.clone()
     };
 
@@ -377,7 +392,6 @@ fn apply_mesh_event(state: &mut PluginState, event: &proto::MeshEvent) -> Option
     if !event.mesh_id.is_empty() {
         state.local.mesh_id = Some(event.mesh_id.clone());
     }
-    refresh_local_advertisement(state);
 
     let mut advertise_to_peer = None;
     if let Some(peer) = event.peer.as_ref() {
@@ -419,20 +433,19 @@ fn apply_mesh_event(state: &mut PluginState, event: &proto::MeshEvent) -> Option
     advertise_to_peer
 }
 
-fn merge_advertisement(
-    state: &mut PluginState,
-    peer_id: String,
-    advertisement: NodeAdvertisement,
-) {
-    let entry = state.known_hosts.entry(peer_id.clone()).or_insert_with(|| KnownHost {
-        peer_id,
-        role: "flock".to_string(),
-        version: advertisement.plugin_version.clone(),
-        rtt_ms: None,
-        capabilities: vec!["channel:flock".to_string()],
-        last_seen: SystemTime::now(),
-        advertisement: None,
-    });
+fn merge_advertisement(state: &mut PluginState, peer_id: String, advertisement: NodeAdvertisement) {
+    let entry = state
+        .known_hosts
+        .entry(peer_id.clone())
+        .or_insert_with(|| KnownHost {
+            peer_id,
+            role: "flock".to_string(),
+            version: advertisement.plugin_version.clone(),
+            rtt_ms: None,
+            capabilities: vec!["channel:flock".to_string()],
+            last_seen: SystemTime::now(),
+            advertisement: None,
+        });
 
     entry.version = advertisement.plugin_version.clone();
     entry.last_seen = SystemTime::now();
@@ -441,13 +454,17 @@ fn merge_advertisement(
     prune_stale_hosts(state);
 }
 
-fn refresh_local_advertisement(state: &mut PluginState) {
-    if let Ok(advertisement) = build_local_advertisement(state) {
+async fn refresh_local_advertisement(state: &mut PluginState) {
+    let healthy = state.goosed.health_check().await;
+    if let Ok(advertisement) = build_local_advertisement(state, state.goosed.snapshot(healthy)) {
         state.local.last_advertisement = Some(advertisement);
     }
 }
 
-fn build_local_advertisement(state: &PluginState) -> Result<NodeAdvertisement> {
+fn build_local_advertisement(
+    state: &PluginState,
+    goosed: GoosedStatus,
+) -> Result<NodeAdvertisement> {
     let mut system = System::new_all();
     system.refresh_all();
 
@@ -477,6 +494,7 @@ fn build_local_advertisement(state: &PluginState) -> Result<NodeAdvertisement> {
         hostname: state.local.hostname.clone(),
         display_name: state.local.display_name.clone(),
         local_port: state.routing.local_port,
+        goosed,
         working_dir: state.routing.working_dir.display().to_string(),
         active_chat_count: state.session_bindings.len(),
         emitted_at_unix_ms: unix_time_millis(SystemTime::now()),
@@ -531,12 +549,26 @@ fn health_json(state: &PluginState) -> Result<serde_json::Value> {
                 version: &host.version,
                 rtt_ms: host.rtt_ms,
                 capability_count: host.capabilities.len(),
-                hostname: host.advertisement.as_ref().map(|value| value.hostname.as_str()),
+                hostname: host
+                    .advertisement
+                    .as_ref()
+                    .map(|value| value.hostname.as_str()),
                 operating_system: host
                     .advertisement
                     .as_ref()
                     .map(|value| value.os.name.as_str()),
-                cpu_load_pct: host.advertisement.as_ref().map(|value| value.load.cpu_load_pct),
+                goosed_healthy: host
+                    .advertisement
+                    .as_ref()
+                    .map(|value| value.goosed.healthy),
+                goosed_version: host
+                    .advertisement
+                    .as_ref()
+                    .and_then(|value| value.goosed.version.as_deref()),
+                cpu_load_pct: host
+                    .advertisement
+                    .as_ref()
+                    .map(|value| value.load.cpu_load_pct),
                 memory_used_pct: host
                     .advertisement
                     .as_ref()
@@ -581,10 +613,12 @@ fn unix_time_millis(value: SystemTime) -> u64 {
 fn prune_stale_hosts(state: &mut PluginState) {
     let stale_after = Duration::from_secs(state.routing.stale_after_secs);
     let now = SystemTime::now();
-    state.known_hosts.retain(|_, host| match now.duration_since(host.last_seen) {
-        Ok(elapsed) => elapsed <= stale_after,
-        Err(_) => true,
-    });
+    state
+        .known_hosts
+        .retain(|_, host| match now.duration_since(host.last_seen) {
+            Ok(elapsed) => elapsed <= stale_after,
+            Err(_) => true,
+        });
 }
 
 fn detect_hostname() -> String {
@@ -631,8 +665,12 @@ fn sanitize_hostname(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_advertisement, percentage, sanitize_hostname, KnownHost, NodeAdvertisement, OsSnapshot, CpuSnapshot, MemorySnapshot, DiskSnapshot, LoadSnapshot, PluginState, LocalNodeState};
+    use super::{
+        merge_advertisement, percentage, sanitize_hostname, CpuSnapshot, DiskSnapshot, KnownHost,
+        LoadSnapshot, LocalNodeState, MemorySnapshot, NodeAdvertisement, OsSnapshot, PluginState,
+    };
     use crate::config::RoutingConfig;
+    use crate::goosed::{GoosedStatus, GoosedSupervisor};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::{Instant, SystemTime};
@@ -673,6 +711,7 @@ mod tests {
             session_bindings: BTreeMap::new(),
             next_chat_target: None,
             http_server_started: false,
+            goosed: GoosedSupervisor::new(43123),
         };
 
         state.known_hosts.insert(
@@ -699,6 +738,14 @@ mod tests {
                 hostname: "host-a".to_string(),
                 display_name: "host-a".to_string(),
                 local_port: 43123,
+                goosed: GoosedStatus {
+                    available: true,
+                    healthy: true,
+                    version: Some("goosed 0.1.0".to_string()),
+                    port: 43124,
+                    binary_path: Some("/tmp/goosed".to_string()),
+                    last_error: None,
+                },
                 working_dir: "/tmp".to_string(),
                 active_chat_count: 0,
                 emitted_at_unix_ms: 0,
@@ -731,7 +778,9 @@ mod tests {
         let host = state.known_hosts.get("peer-a").expect("known host");
         assert_eq!(host.version, "0.1.0");
         assert_eq!(
-            host.advertisement.as_ref().map(|value| value.hostname.as_str()),
+            host.advertisement
+                .as_ref()
+                .map(|value| value.hostname.as_str()),
             Some("host-a")
         );
     }
