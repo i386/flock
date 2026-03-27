@@ -1,6 +1,6 @@
 # flock
 
-`flock` routes Goose traffic over a private `mesh-llm` mesh so Goose can run against a remote `goosed` on another machine without Goose needing to understand mesh routing.
+`flock` routes Goose traffic over a private [`mesh-llm`](https://github.com/michaelneale/mesh-llm) mesh so Goose can run against a remote `goosed` on another machine without Goose needing to understand mesh routing.
 
 The intended user experience is:
 
