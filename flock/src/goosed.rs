@@ -60,6 +60,10 @@ impl GoosedSupervisor {
         }
     }
 
+    pub fn secret_key(&self) -> &str {
+        &self.secret_key
+    }
+
     pub async fn ensure_started(&mut self) -> Result<()> {
         let Some(binary_path) = self.binary_path.clone() else {
             self.last_error = Some("goosed binary not found".to_string());

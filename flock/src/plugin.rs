@@ -3,25 +3,26 @@ use crate::goosed::{GoosedStatus, GoosedSupervisor};
 use anyhow::Result;
 use axum::{extract::State as AxumState, http::StatusCode, routing::get, Json, Router};
 use mesh_llm_plugin::{
-    plugin_server_info, proto, PluginContext, PluginInitializeRequest, PluginMetadata,
-    PluginRuntime, PluginStartupPolicy, SimplePlugin,
+    plugin_server_info, proto, PluginContext, PluginHandle, PluginInitializeRequest,
+    PluginMetadata, PluginRuntime, PluginStartupPolicy, SimplePlugin,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, System};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 const PLUGIN_ID: &str = "flock";
 const FLOCK_CHANNEL: &str = "flock";
 const FLOCK_PROTOCOL_VERSION: u32 = 1;
 const MESSAGE_KIND_ADVERTISEMENT: &str = "flock.advertisement.v1";
 const MESSAGE_KIND_SNAPSHOT_REQUEST: &str = "flock.snapshot_request.v1";
+const MESSAGE_KIND_HTTP_REQUEST: &str = "flock.http.request.v1";
+const MESSAGE_KIND_HTTP_RESPONSE: &str = "flock.http.response.v1";
 
-#[derive(Debug)]
 pub struct PluginState {
     config_path: PathBuf,
     routing: RoutingConfig,
@@ -33,6 +34,9 @@ pub struct PluginState {
     next_chat_target: Option<String>,
     http_server_started: bool,
     goosed: GoosedSupervisor,
+    outbound: Option<PluginHandle>,
+    next_proxy_request_id: u64,
+    pending_proxy_requests: HashMap<String, oneshot::Sender<HttpProxyResponse>>,
 }
 
 #[derive(Debug)]
@@ -58,6 +62,27 @@ pub struct KnownHost {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct SnapshotRequest {
     protocol_version: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct HttpProxyRequestMeta {
+    protocol_version: u32,
+    request_id: String,
+    method: String,
+    path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct HttpProxyResponseMeta {
+    protocol_version: u32,
+    request_id: String,
+    status_code: u16,
+}
+
+#[derive(Debug, Clone)]
+struct HttpProxyResponse {
+    status_code: u16,
+    body: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -171,6 +196,9 @@ pub async fn run_plugin(config_path: PathBuf, routing: RoutingConfig) -> Result<
         session_bindings: BTreeMap::new(),
         http_server_started: false,
         goosed,
+        outbound: None,
+        next_proxy_request_id: 1,
+        pending_proxy_requests: HashMap::new(),
     }));
 
     {
@@ -199,10 +227,12 @@ pub async fn run_plugin(config_path: PathBuf, routing: RoutingConfig) -> Result<
         .with_capabilities(vec!["mesh-events".to_string(), "channel:flock".to_string()])
         .with_startup_policy(PluginStartupPolicy::PrivateMeshOnly),
     )
-    .on_initialize(move |request, _context| {
+    .on_initialize(move |request, context| {
         let state = initialize_state.clone();
         Box::pin(async move {
-            state.lock().await.last_initialize = Some(request);
+            let mut state = state.lock().await;
+            state.last_initialize = Some(request);
+            state.outbound = Some(context.handle());
             Ok(())
         })
     })
@@ -321,12 +351,65 @@ async fn handle_channel_message(
             let _: SnapshotRequest = serde_json::from_slice(&message.body)?;
             send_local_advertisement(state, message.source_peer_id, context).await
         }
+        MESSAGE_KIND_HTTP_REQUEST => {
+            let meta: HttpProxyRequestMeta = serde_json::from_str(&message.metadata_json)?;
+            let response = forward_local_goosed_request(state, &meta, &message.body).await;
+            let (status_code, body) = match response {
+                Ok(value) => (value.status_code, value.body),
+                Err(error) => (502, error.to_string().into_bytes()),
+            };
+
+            context
+                .send_channel(proto::ChannelMessage {
+                    channel: FLOCK_CHANNEL.to_string(),
+                    source_peer_id: String::new(),
+                    target_peer_id: message.source_peer_id,
+                    content_type: "application/octet-stream".to_string(),
+                    body,
+                    message_kind: MESSAGE_KIND_HTTP_RESPONSE.to_string(),
+                    correlation_id: meta.request_id.clone(),
+                    metadata_json: serde_json::to_string(&HttpProxyResponseMeta {
+                        protocol_version: FLOCK_PROTOCOL_VERSION,
+                        request_id: meta.request_id,
+                        status_code,
+                    })?,
+                })
+                .await
+        }
+        MESSAGE_KIND_HTTP_RESPONSE => {
+            let meta: HttpProxyResponseMeta = serde_json::from_str(&message.metadata_json)?;
+            let mut state = state.lock().await;
+            if let Some(sender) = state.pending_proxy_requests.remove(&meta.request_id) {
+                let _ = sender.send(HttpProxyResponse {
+                    status_code: meta.status_code,
+                    body: message.body,
+                });
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
 
-async fn http_status() -> &'static str {
-    "ok"
+async fn http_status(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+) -> Result<(StatusCode, String), StatusCode> {
+    match proxy_status_to_selected_host(&state).await {
+        Ok(response) => Ok((
+            StatusCode::from_u16(response.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+            String::from_utf8_lossy(&response.body).into_owned(),
+        )),
+        Err(_) => {
+            let mut state = state.lock().await;
+            let _ = state.goosed.ensure_started().await;
+            let healthy = state.goosed.health_check().await;
+            if healthy {
+                Ok((StatusCode::OK, "ok".to_string()))
+            } else {
+                Err(StatusCode::SERVICE_UNAVAILABLE)
+            }
+        }
+    }
 }
 
 async fn http_flock_health(
@@ -363,6 +446,100 @@ async fn http_flock_hosts(
     )
 }
 
+async fn proxy_status_to_selected_host(
+    state: &Arc<Mutex<PluginState>>,
+) -> Result<HttpProxyResponse> {
+    let (handle, target_peer_id, request_id, receiver) = {
+        let mut state = state.lock().await;
+        let handle = state
+            .outbound
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("flock plugin outbound handle not initialized"))?;
+        let target_peer_id = select_proxy_host(&state)
+            .ok_or_else(|| anyhow::anyhow!("no healthy remote flock host available"))?;
+        let request_id = format!("status-{}", state.next_proxy_request_id);
+        state.next_proxy_request_id += 1;
+        let (sender, receiver) = oneshot::channel();
+        state
+            .pending_proxy_requests
+            .insert(request_id.clone(), sender);
+        (handle, target_peer_id, request_id, receiver)
+    };
+
+    let send_result = handle
+        .send_channel(proto::ChannelMessage {
+            channel: FLOCK_CHANNEL.to_string(),
+            source_peer_id: String::new(),
+            target_peer_id,
+            content_type: "application/octet-stream".to_string(),
+            body: Vec::new(),
+            message_kind: MESSAGE_KIND_HTTP_REQUEST.to_string(),
+            correlation_id: request_id.clone(),
+            metadata_json: serde_json::to_string(&HttpProxyRequestMeta {
+                protocol_version: FLOCK_PROTOCOL_VERSION,
+                request_id: request_id.clone(),
+                method: "GET".to_string(),
+                path: "/status".to_string(),
+            })?,
+        })
+        .await;
+
+    if let Err(error) = send_result {
+        let mut state = state.lock().await;
+        state.pending_proxy_requests.remove(&request_id);
+        return Err(error.into());
+    }
+
+    match tokio::time::timeout(Duration::from_secs(3), receiver).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) => Err(anyhow::anyhow!("proxy response channel closed")),
+        Err(_) => {
+            let mut state = state.lock().await;
+            state.pending_proxy_requests.remove(&request_id);
+            Err(anyhow::anyhow!("proxy status request timed out"))
+        }
+    }
+}
+
+fn select_proxy_host(state: &PluginState) -> Option<String> {
+    if let Some(preferred) = state.next_chat_target.as_ref() {
+        if let Some(host) = state.known_hosts.get(preferred) {
+            if host
+                .advertisement
+                .as_ref()
+                .map(|value| value.goosed.healthy)
+                .unwrap_or(false)
+            {
+                return Some(preferred.clone());
+            }
+        }
+    }
+
+    if let Some(preferred) = state.routing.default_host_preference.as_ref() {
+        if let Some(host) = state.known_hosts.get(preferred) {
+            if host
+                .advertisement
+                .as_ref()
+                .map(|value| value.goosed.healthy)
+                .unwrap_or(false)
+            {
+                return Some(preferred.clone());
+            }
+        }
+    }
+
+    state
+        .known_hosts
+        .iter()
+        .find(|(_, host)| {
+            host.advertisement
+                .as_ref()
+                .map(|value| value.goosed.healthy)
+                .unwrap_or(false)
+        })
+        .map(|(peer_id, _)| peer_id.clone())
+}
+
 fn source_peer_id(message: &proto::ChannelMessage, advertisement: &NodeAdvertisement) -> String {
     if !message.source_peer_id.trim().is_empty() {
         message.source_peer_id.clone()
@@ -396,6 +573,32 @@ async fn send_local_advertisement(
             .await?;
     }
     Ok(())
+}
+
+async fn forward_local_goosed_request(
+    state: &Arc<Mutex<PluginState>>,
+    meta: &HttpProxyRequestMeta,
+    body: &[u8],
+) -> Result<HttpProxyResponse> {
+    let (port, secret) = {
+        let mut state = state.lock().await;
+        state.goosed.ensure_started().await?;
+        (state.goosed.snapshot(state.goosed.health_check().await).port, state.goosed.secret_key().to_string())
+    };
+
+    let method = reqwest::Method::from_bytes(meta.method.as_bytes())?;
+    let url = format!("http://127.0.0.1:{port}{}", meta.path);
+    let client = reqwest::Client::new();
+    let response = client
+        .request(method, url)
+        .header("X-Secret-Key", secret)
+        .body(body.to_vec())
+        .send()
+        .await?;
+
+    let status_code = response.status().as_u16();
+    let body = response.bytes().await?.to_vec();
+    Ok(HttpProxyResponse { status_code, body })
 }
 
 fn apply_mesh_event(state: &mut PluginState, event: &proto::MeshEvent) -> Option<String> {
@@ -684,7 +887,7 @@ mod tests {
     };
     use crate::config::RoutingConfig;
     use crate::goosed::{GoosedStatus, GoosedSupervisor};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::path::PathBuf;
     use std::time::{Instant, SystemTime};
 
@@ -725,6 +928,9 @@ mod tests {
             next_chat_target: None,
             http_server_started: false,
             goosed: GoosedSupervisor::new(43123),
+            outbound: None,
+            next_proxy_request_id: 1,
+            pending_proxy_requests: HashMap::new(),
         };
 
         state.known_hosts.insert(
