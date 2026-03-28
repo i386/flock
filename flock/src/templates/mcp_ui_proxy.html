@@ -1,0 +1,101 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="referrer" content="no-referrer"/>
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src * 'wasm-unsafe-eval' 'unsafe-inline' 'unsafe-eval' blob:; style-src * 'unsafe-inline'; font-src *; img-src *; connect-src *; frame-src *; media-src *; base-uri 'self'; upgrade-insecure-requests"/>
+    <title>MCP-UI Proxy</title>
+    <style>
+      body,
+      html {
+        margin: 0;
+        height: 100vh;
+        width: 100vw;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      iframe {
+        background-color: transparent;
+        border: 0 none transparent;
+        padding: 0;
+        overflow: hidden;
+        flex-grow: 1;
+      }
+    </style>
+  </head>
+  <body>
+    <script>
+      const params = new URLSearchParams(location.search);
+      const contentType = params.get('contentType');
+      const target = params.get('url');
+
+      function isValidHttpUrl(string) {
+        try {
+          const url = new URL(string);
+          return url.protocol === 'http:' || url.protocol === 'https:';
+        } catch (error) {
+          return false;
+        }
+      }
+
+      if (contentType === 'rawhtml') {
+        const inner = document.createElement('iframe');
+        inner.style = 'width:100%; height:100%; border:none;';
+        inner.setAttribute('sandbox', 'allow-scripts');
+        document.body.appendChild(inner);
+
+        window.addEventListener('message', (event) => {
+          if (event.source === window.parent) {
+            if (event.data && event.data.type === 'ui-html-content') {
+              const payload = event.data.payload || {};
+              const html = payload.html;
+              const sandbox = payload.sandbox;
+              if (typeof sandbox === 'string') {
+                inner.setAttribute('sandbox', sandbox);
+              }
+              if (typeof html === 'string') {
+                inner.srcdoc = html;
+              }
+            } else if (inner && inner.contentWindow) {
+              inner.contentWindow.postMessage(event.data, '*');
+            }
+          } else if (event.source === inner.contentWindow) {
+            window.parent.postMessage(event.data, '*');
+          }
+        });
+
+        window.parent.postMessage({ type: 'ui-proxy-iframe-ready' }, '*');
+      } else if (target) {
+        if (!isValidHttpUrl(target)) {
+          document.body.textContent = 'Error: invalid URL. Only HTTP and HTTPS URLs are allowed.';
+        } else {
+          const inner = document.createElement('iframe');
+          inner.src = target;
+          inner.style = 'width:100%; height:100%; border:none;';
+          inner.setAttribute('sandbox', 'allow-same-origin allow-scripts');
+          document.body.appendChild(inner);
+          const urlOrigin = new URL(target).origin;
+
+          window.addEventListener('message', (event) => {
+            if (event.source === window.parent) {
+              if (inner.contentWindow) {
+                inner.contentWindow.postMessage(event.data, urlOrigin);
+              }
+            } else if (event.source === inner.contentWindow) {
+              window.parent.postMessage(event.data, '*');
+            }
+          });
+        }
+      } else {
+        document.body.textContent = 'Error: missing url or html parameter';
+      }
+    </script>
+  </body>
+</html>

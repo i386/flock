@@ -1,10 +1,12 @@
-use crate::config::RoutingConfig;
+use crate::config::{RoutingConfig, DEFAULT_LOCAL_SECRET};
 use crate::goosed::{GoosedStatus, GoosedSupervisor};
 use anyhow::Result;
 use axum::{
     body::{Body, Bytes},
-    extract::{OriginalUri, Path as AxumPath, State as AxumState},
+    extract::Request,
+    extract::{OriginalUri, Path as AxumPath, Query, State as AxumState},
     http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::Response,
     routing::{get, post},
     Json, Router,
@@ -21,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, System};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 
 const PLUGIN_ID: &str = "flock";
@@ -36,6 +38,10 @@ const MESSAGE_KIND_HTTP_STREAM_OPEN: &str = "flock.http.stream_open.v1";
 const MESSAGE_KIND_HTTP_STREAM_CHUNK: &str = "flock.http.stream_chunk.v1";
 const MESSAGE_KIND_HTTP_STREAM_CLOSE: &str = "flock.http.stream_close.v1";
 const LOCAL_BINDING_ID: &str = "__local__";
+const GUEST_HTML_TTL_SECS: u64 = 300;
+const GUEST_HTML_MAX_ENTRIES: usize = 64;
+const MCP_UI_PROXY_HTML: &str = include_str!("templates/mcp_ui_proxy.html");
+const MCP_APP_PROXY_HTML: &str = include_str!("templates/mcp_app_proxy.html");
 
 pub struct PluginState {
     config_path: PathBuf,
@@ -53,6 +59,7 @@ pub struct PluginState {
     pending_proxy_requests: HashMap<String, oneshot::Sender<HttpProxyResponse>>,
     pending_stream_open: HashMap<String, oneshot::Sender<HttpStreamOpen>>,
     pending_stream_bodies: HashMap<String, mpsc::Sender<Result<Bytes, std::convert::Infallible>>>,
+    guest_store: Arc<RwLock<HashMap<String, (String, String, Instant)>>>,
 }
 
 #[derive(Debug)]
@@ -116,6 +123,34 @@ struct HttpStreamOpen {
 struct HttpStreamClose {
     protocol_version: u32,
     request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalProxyQuery {
+    secret: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalMcpAppProxyQuery {
+    secret: String,
+    connect_domains: Option<String>,
+    resource_domains: Option<String>,
+    frame_domains: Option<String>,
+    base_uri_domains: Option<String>,
+    script_domains: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalGuestQuery {
+    secret: String,
+    nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalStoreGuestBody {
+    secret: String,
+    html: String,
+    csp: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -247,6 +282,7 @@ pub async fn run_plugin(config_path: PathBuf, routing: RoutingConfig) -> Result<
         pending_proxy_requests: HashMap::new(),
         pending_stream_open: HashMap::new(),
         pending_stream_bodies: HashMap::new(),
+        guest_store: Arc::new(RwLock::new(HashMap::new())),
     }));
 
     {
@@ -389,8 +425,15 @@ async fn ensure_local_http_server(state: Arc<Mutex<PluginState>>) -> Result<()> 
         .route("/sessions/{session_id}/events", get(http_session_events))
         .route("/sessions/{session_id}/reply", post(http_session_reply))
         .route("/sessions/{session_id}/cancel", post(http_session_cancel))
+        .route("/mcp-ui-proxy", get(http_mcp_ui_proxy))
+        .route("/mcp-app-proxy", get(http_mcp_app_proxy))
+        .route(
+            "/mcp-app-guest",
+            get(http_mcp_app_guest_get).post(http_mcp_app_guest_post),
+        )
         .route("/flock/health", get(http_flock_health))
         .route("/flock/hosts", get(http_flock_hosts))
+        .layer(middleware::from_fn(require_local_secret))
         .with_state(state.clone());
 
     tokio::spawn(async move {
@@ -507,6 +550,150 @@ async fn handle_channel_message(
         }
         _ => Ok(()),
     }
+}
+
+async fn require_local_secret(request: Request, next: Next) -> Result<Response, StatusCode> {
+    match request.uri().path() {
+        "/status" | "/features" | "/mcp-ui-proxy" | "/mcp-app-proxy" | "/mcp-app-guest" => {
+            return Ok(next.run(request).await)
+        }
+        _ => {}
+    }
+
+    let secret = request
+        .headers()
+        .get("X-Secret-Key")
+        .and_then(|value| value.to_str().ok());
+
+    match secret {
+        Some(value) if value == DEFAULT_LOCAL_SECRET => Ok(next.run(request).await),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+async fn http_mcp_ui_proxy(Query(query): Query<LocalProxyQuery>) -> Result<Response, StatusCode> {
+    if query.secret != DEFAULT_LOCAL_SECRET {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(
+            header::HeaderName::from_static("referrer-policy"),
+            "no-referrer",
+        )
+        .body(Body::from(MCP_UI_PROXY_HTML))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_mcp_app_proxy(
+    Query(query): Query<LocalMcpAppProxyQuery>,
+) -> Result<Response, StatusCode> {
+    if query.secret != DEFAULT_LOCAL_SECRET {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let html = MCP_APP_PROXY_HTML.replace(
+        "{{OUTER_CSP}}",
+        &build_outer_csp(
+            &parse_domains(query.connect_domains.as_ref()),
+            &parse_domains(query.resource_domains.as_ref()),
+            &parse_domains(query.frame_domains.as_ref()),
+            &parse_domains(query.base_uri_domains.as_ref()),
+            &parse_domains(query.script_domains.as_ref()),
+        ),
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(
+            header::HeaderName::from_static("referrer-policy"),
+            "no-referrer",
+        )
+        .body(Body::from(html))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_mcp_app_guest_post(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    Json(body): Json<LocalStoreGuestBody>,
+) -> Result<Response, StatusCode> {
+    if body.secret != DEFAULT_LOCAL_SECRET {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let guest_store = {
+        let state = state.lock().await;
+        state.guest_store.clone()
+    };
+
+    let nonce = random_nonce();
+    let csp = body.csp.unwrap_or_default();
+
+    {
+        let mut store = guest_store.write().await;
+        let cutoff = Instant::now() - Duration::from_secs(GUEST_HTML_TTL_SECS);
+        store.retain(|_, (_, _, created)| *created > cutoff);
+
+        if store.len() >= GUEST_HTML_MAX_ENTRIES {
+            if let Some(oldest_key) = store
+                .iter()
+                .min_by_key(|(_, (_, _, created))| *created)
+                .map(|(key, _)| key.clone())
+            {
+                store.remove(&oldest_key);
+            }
+        }
+
+        store.insert(nonce.clone(), (body.html, csp, Instant::now()));
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(format!(r#"{{"nonce":"{}"}}"#, nonce)))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_mcp_app_guest_get(
+    AxumState(state): AxumState<Arc<Mutex<PluginState>>>,
+    Query(query): Query<LocalGuestQuery>,
+) -> Result<Response, StatusCode> {
+    if query.secret != DEFAULT_LOCAL_SECRET {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let guest_store = {
+        let state = state.lock().await;
+        state.guest_store.clone()
+    };
+
+    let entry = {
+        let mut store = guest_store.write().await;
+        store.remove(&query.nonce)
+    };
+
+    let Some((html, csp, _)) = entry else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(
+            header::HeaderName::from_static("referrer-policy"),
+            "strict-origin",
+        );
+
+    if !csp.is_empty() {
+        response = response.header(header::CONTENT_SECURITY_POLICY, csp);
+    }
+
+    response
+        .body(Body::from(html))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn http_status(
@@ -1400,6 +1587,11 @@ fn headers_from_map(headers: &BTreeMap<String, String>) -> reqwest::header::Head
     result
 }
 
+fn random_nonce() -> String {
+    let bytes: [u8; 16] = rand::random();
+    hex::encode(bytes)
+}
+
 fn source_peer_id(message: &proto::ChannelMessage, advertisement: &NodeAdvertisement) -> String {
     if !message.source_peer_id.trim().is_empty() {
         message.source_peer_id.clone()
@@ -1806,6 +1998,71 @@ fn estimate_available_disk_bytes(working_dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+fn build_outer_csp(
+    connect_domains: &[String],
+    resource_domains: &[String],
+    frame_domains: &[String],
+    base_uri_domains: &[String],
+    script_domains: &[String],
+) -> String {
+    let resources = if resource_domains.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", resource_domains.join(" "))
+    };
+
+    let scripts = if script_domains.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", script_domains.join(" "))
+    };
+
+    let connections = if connect_domains.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", connect_domains.join(" "))
+    };
+
+    let frame_src = if frame_domains.is_empty() {
+        "frame-src 'self'".to_string()
+    } else {
+        format!("frame-src 'self' {}", frame_domains.join(" "))
+    };
+
+    let base_uris = if base_uri_domains.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", base_uri_domains.join(" "))
+    };
+
+    format!(
+        "default-src 'none'; \
+         script-src 'self' 'unsafe-inline'{resources}{scripts}; \
+         script-src-elem 'self' 'unsafe-inline'{resources}{scripts}; \
+         style-src 'self' 'unsafe-inline'{resources}; \
+         style-src-elem 'self' 'unsafe-inline'{resources}; \
+         connect-src 'self'{connections}; \
+         img-src 'self' data: blob:{resources}; \
+         font-src 'self'{resources}; \
+         media-src 'self' data: blob:{resources}; \
+         {frame_src}; \
+         object-src 'none'; \
+         base-uri 'self'{base_uris}"
+    )
+}
+
+fn parse_domains(domains: Option<&String>) -> Vec<String> {
+    domains
+        .map(|domains| {
+            domains
+                .split(',')
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn percentage(used: u64, total: u64) -> f32 {
     if total == 0 {
         0.0
@@ -1884,7 +2141,9 @@ mod tests {
     use crate::goosed::{GoosedStatus, GoosedSupervisor};
     use std::collections::{BTreeMap, HashMap};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{Instant, SystemTime};
+    use tokio::sync::RwLock;
 
     #[test]
     fn hostname_is_normalized_for_display() {
@@ -1928,6 +2187,7 @@ mod tests {
             pending_proxy_requests: HashMap::new(),
             pending_stream_open: HashMap::new(),
             pending_stream_bodies: HashMap::new(),
+            guest_store: Arc::new(RwLock::new(HashMap::new())),
         };
 
         state.known_hosts.insert(

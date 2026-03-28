@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_LOCAL_PORT: i64 = 43123;
+pub const DEFAULT_LOCAL_SECRET: &str = "flock-local";
 pub const DEFAULT_PUBLISH_INTERVAL_SECS: i64 = 5;
 pub const DEFAULT_STALE_AFTER_SECS: i64 = 20;
 pub const DEFAULT_MAX_CPU_LOAD_PCT: i64 = 95;
