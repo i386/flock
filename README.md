@@ -156,6 +156,7 @@ Primary docs:
 - [Route Inventory](/Users/jdumay/code/flock/specs/route-inventory.md)
 - [mesh-llm Protocol Changes](/Users/jdumay/code/flock/specs/mesh-llm-protocol-changes.md)
 - [Roadmap](/Users/jdumay/code/flock/ROADMAP.md)
+- [E2E Testing](/Users/jdumay/code/flock/E2E.md)
 
 ## Development
 
