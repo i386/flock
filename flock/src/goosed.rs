@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -92,6 +93,18 @@ impl GoosedSupervisor {
         }
 
         let mut command = Command::new(&binary_path);
+        let stdout_log_path = std::env::temp_dir().join(format!("flock-goosed-{}.stdout.log", self.port));
+        let stderr_log_path = std::env::temp_dir().join(format!("flock-goosed-{}.stderr.log", self.port));
+        let stdout = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stdout_log_path)
+            .with_context(|| format!("failed to open {}", stdout_log_path.display()))?;
+        let stderr = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stderr_log_path)
+            .with_context(|| format!("failed to open {}", stderr_log_path.display()))?;
         command
             .arg("agent")
             .env("GOOSE_HOST", "127.0.0.1")
@@ -99,8 +112,8 @@ impl GoosedSupervisor {
             .env("GOOSE_TLS", "false")
             .env("GOOSE_SERVER__SECRET_KEY", &self.secret_key)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
 
         let child = command
             .spawn()

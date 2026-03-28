@@ -470,6 +470,16 @@ async fn handle_channel_message(
         }
         MESSAGE_KIND_HTTP_REQUEST => {
             let meta: HttpProxyRequestMeta = serde_json::from_str(&message.metadata_json)?;
+            let request_id = meta.request_id.clone();
+            let reply_target = message.source_peer_id.clone();
+            eprintln!(
+                "flock http request recv request_id={} method={} path={} from={} body_bytes={}",
+                request_id,
+                meta.method,
+                meta.path,
+                message.source_peer_id,
+                message.body.len()
+            );
             let response = forward_local_goosed_request(
                 state,
                 &meta.method,
@@ -486,27 +496,43 @@ async fn handle_channel_message(
                     error.to_string().into_bytes(),
                 ),
             };
+            let body_len = body.len();
 
             context
                 .send_channel(proto::ChannelMessage {
                     channel: FLOCK_CHANNEL.to_string(),
                     source_peer_id: String::new(),
-                    target_peer_id: message.source_peer_id,
+                    target_peer_id: reply_target.clone(),
                     content_type: "application/octet-stream".to_string(),
                     body,
                     message_kind: MESSAGE_KIND_HTTP_RESPONSE.to_string(),
-                    correlation_id: meta.request_id.clone(),
+                    correlation_id: request_id.clone(),
                     metadata_json: serde_json::to_string(&HttpProxyResponseMeta {
                         protocol_version: FLOCK_PROTOCOL_VERSION,
-                        request_id: meta.request_id,
+                        request_id: request_id.clone(),
                         status_code,
                         content_type,
                     })?,
                 })
-                .await
+                .await?;
+            eprintln!(
+                "flock http response sent request_id={} to={} status={} body_bytes={}",
+                request_id,
+                reply_target,
+                status_code,
+                body_len
+            );
+            Ok(())
         }
         MESSAGE_KIND_HTTP_RESPONSE => {
             let meta: HttpProxyResponseMeta = serde_json::from_str(&message.metadata_json)?;
+            eprintln!(
+                "flock http response recv request_id={} from={} status={} body_bytes={}",
+                meta.request_id,
+                message.source_peer_id,
+                meta.status_code,
+                message.body.len()
+            );
             let mut state = state.lock().await;
             if let Some(sender) = state.pending_proxy_requests.remove(&meta.request_id) {
                 let _ = sender.send(HttpProxyResponse {
@@ -1140,14 +1166,18 @@ async fn proxy_agent_start_route(
         {
             if let Some(session_id) = extract_session_id_from_response(&response.body) {
                 let mut state = state.lock().await;
-                state.session_bindings.insert(session_id, target_peer_id);
+                state
+                    .session_bindings
+                    .insert(session_id, target_peer_id.clone());
                 state.next_chat_target = None;
             }
+            eprintln!("flock agent/start using remote target={target_peer_id}");
             return Ok(response_with_content_type(
                 response,
                 Some("application/json"),
             ));
         }
+        eprintln!("flock agent/start remote proxy failed, falling back local");
     }
 
     match forward_local_goosed_request(
@@ -1435,7 +1465,7 @@ async fn proxy_request_to_host(
         .send_channel(proto::ChannelMessage {
             channel: FLOCK_CHANNEL.to_string(),
             source_peer_id: String::new(),
-            target_peer_id,
+            target_peer_id: target_peer_id.clone(),
             content_type: "application/octet-stream".to_string(),
             body,
             message_kind: MESSAGE_KIND_HTTP_REQUEST.to_string(),
@@ -1453,15 +1483,27 @@ async fn proxy_request_to_host(
     if let Err(error) = send_result {
         let mut state = state.lock().await;
         state.pending_proxy_requests.remove(&request_id);
+        eprintln!(
+            "flock proxy send failed request_id={} method={} path={} target={} error={}",
+            request_id, method, path, target_peer_id, error
+        );
         return Err(error.into());
     }
+    eprintln!(
+        "flock proxy send request_id={} method={} path={} target={}",
+        request_id, method, path, target_peer_id
+    );
 
     match tokio::time::timeout(Duration::from_secs(3), receiver).await {
         Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) => Err(anyhow::anyhow!("proxy response channel closed")),
+        Ok(Err(_)) => {
+            eprintln!("flock proxy recv channel closed request_id={request_id}");
+            Err(anyhow::anyhow!("proxy response channel closed"))
+        }
         Err(_) => {
             let mut state = state.lock().await;
             state.pending_proxy_requests.remove(&request_id);
+            eprintln!("flock proxy timeout request_id={request_id}");
             Err(anyhow::anyhow!("proxy status request timed out"))
         }
     }

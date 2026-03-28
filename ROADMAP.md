@@ -42,6 +42,7 @@ These features are explicitly deferred until after the core routing/proxying des
 - schedules UI parity
 - diagnostics bundle download and bug-report helpers
 - telemetry parity
+- security review
 - tunnel settings parity
 - gateway settings parity
 - full MCP app parity if it is not required for the v1 capability target
