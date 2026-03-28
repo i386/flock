@@ -171,18 +171,35 @@ Default tests stay fast:
 cargo test
 ```
 
-Opt-in Ollama E2E smoke:
+Opt-in local mesh E2E smoke:
 
 ```bash
-cargo test ollama_e2e -- --ignored --nocapture
+cargo test local_mesh_e2e -- --ignored --nocapture
 ```
 
-E2E prerequisites:
+Opt-in SSH-backed private-mesh E2E:
 
-- local Ollama on `127.0.0.1:11434`
-- model `llama3.1` already pulled
+```bash
+FLOCK_SSH_HOST=studio54.local cargo test ssh_private_mesh_e2e -- --ignored --nocapture
+```
+
+Local mesh E2E prerequisites:
+
 - local `mesh-llm` binary at `../mesh-llm/target/debug/mesh-llm`
 - local `goosed` binary at `../goose/target/debug/goosed`
+- local llama.cpp binaries at `../mesh-llm/llama.cpp/build-flock/bin`
+- local model `~/.models/Qwen2.5-3B-Instruct-Q4_K_M.gguf`
+- the current user can write `/tmp/mesh-llm-llama-server.log`
+
+SSH E2E prerequisites:
+
+- `FLOCK_SSH_HOST` points at a second machine reachable with SSH keys
+- the remote machine can run the locally built binaries staged by the test
+- the remote machine already has `~/.models/Qwen2.5-3B-Instruct-Q4_K_M.gguf`
+- local llama.cpp binaries exist at `../mesh-llm/llama.cpp/build-flock/bin`
+- the remote machine can write `/tmp/mesh-llm-llama-server.log`
+
+The SSH E2E stages `mesh-llm`, `flock`, `goosed`, `rpc-server`, and `llama-server` onto the remote machine, runs a private two-node mesh, creates a Goose session through the laptop-side `flock` endpoint, and verifies that the session/reply/events flow completes against the remote node.
 
 Smoke-test install against a temporary config:
 
