@@ -140,6 +140,12 @@ That means v1 is centered on:
 
 Broader parity such as full settings UI, schedules, recipes, diagnostics, tunnel/gateway controls, and MCP app parity is deferred.
 
+## Goose Dependency
+
+`flock` currently depends on the Goose session metadata fix in [block/goose#8164](https://github.com/block/goose/pull/8164).
+
+Without that change, freshly created or resumed sessions can report missing provider/model metadata even when the backend has a valid global provider configured, which is visible to external-backend clients like `flock`.
+
 ## Specs
 
 Primary docs:
@@ -158,6 +164,25 @@ Build:
 ```bash
 cargo build
 ```
+
+Default tests stay fast:
+
+```bash
+cargo test
+```
+
+Opt-in Ollama E2E smoke:
+
+```bash
+cargo test ollama_e2e -- --ignored --nocapture
+```
+
+E2E prerequisites:
+
+- local Ollama on `127.0.0.1:11434`
+- model `llama3.1` already pulled
+- local `mesh-llm` binary at `../mesh-llm/target/debug/mesh-llm`
+- local `goosed` binary at `../goose/target/debug/goosed`
 
 Smoke-test install against a temporary config:
 
