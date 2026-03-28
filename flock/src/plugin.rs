@@ -976,6 +976,10 @@ async fn proxy_event_stream_route(
     headers: BTreeMap<String, String>,
 ) -> Result<Response, StatusCode> {
     let target_peer_id = resolve_session_target(state, session_id).await?;
+    if target_peer_id == LOCAL_BINDING_ID {
+        return stream_local_goosed_route(state, path, &headers).await;
+    }
+
     let (handle, request_id, open_rx, body_rx) = {
         let mut state = state.lock().await;
         let handle = state
@@ -1054,6 +1058,62 @@ async fn proxy_event_stream_route(
 
     let body_stream = ReceiverStream::new(body_rx);
     response_builder
+        .body(Body::from_stream(body_stream))
+        .map_err(|_| StatusCode::BAD_GATEWAY)
+}
+
+async fn stream_local_goosed_route(
+    state: &Arc<Mutex<PluginState>>,
+    path: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<Response, StatusCode> {
+    let (port, secret) = {
+        let mut state = state.lock().await;
+        state
+            .goosed
+            .ensure_started()
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        (
+            state
+                .goosed
+                .snapshot(state.goosed.health_check().await)
+                .port,
+            state.goosed.secret_key().to_string(),
+        )
+    };
+
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let client = reqwest::Client::new();
+    let response = client
+        .get(url)
+        .header("X-Secret-Key", secret)
+        .headers(headers_from_map(headers))
+        .send()
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("text/event-stream")
+        .to_string();
+    let body_stream = response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(|_| std::io::Error::other("stream read error")));
+
+    Response::builder()
+        .status(status)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_str(&content_type)
+                .unwrap_or(HeaderValue::from_static("text/event-stream")),
+        )
+        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
+        .header(header::CONNECTION, HeaderValue::from_static("keep-alive"))
         .body(Body::from_stream(body_stream))
         .map_err(|_| StatusCode::BAD_GATEWAY)
 }
